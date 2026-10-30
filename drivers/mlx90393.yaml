@@ -2,10 +2,6 @@
 # MLX90393, native ESPHome driver. https://esphome.io/components/sensor/mlx90393/
 # Factory address is 0x0C. Adafruit STEMMA QT breakouts sold since May 2023 use 0x18:
 # override with  sensor: [{id: !extend magnetometer, address: 0x18}]
-logger:
-  logs:
-    mlx90393: INFO
-
 sensor:
   - platform: mlx90393
     id: magnetometer

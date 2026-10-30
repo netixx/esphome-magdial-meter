@@ -1,9 +1,5 @@
 ---
 # HMC5883L, native ESPHome driver. https://esphome.io/components/sensor/hmc5883l/
-logger:
-  logs:
-    hmc5883l: INFO
-
 sensor:
   - platform: hmc5883l
     id: magnetometer

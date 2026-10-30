@@ -1,10 +1,6 @@
 ---
 # QMC5883L, native ESPHome driver. https://esphome.io/components/sensor/qmc5883l/
 # If the field saturates (flat tops in the debug graphs), set range: 800µT with !extend.
-logger:
-  logs:
-    qmc5883l: INFO
-
 sensor:
   - platform: qmc5883l
     id: magnetometer

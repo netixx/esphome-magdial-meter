@@ -1,9 +1,5 @@
 ---
 # MMC5603, native ESPHome driver. https://esphome.io/components/sensor/mmc5603/
-logger:
-  logs:
-    mmc5603: INFO
-
 sensor:
   - platform: mmc5603
     id: magnetometer

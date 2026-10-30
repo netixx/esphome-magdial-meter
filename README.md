@@ -54,6 +54,16 @@ sensor:
 Your config must have an `api:` block (the package adds the `set_total` action to it). See
 [example-esp32.yaml](example-esp32.yaml) for a full device config.
 
+The package sets no log levels, so it works with any `logger:` level. At the default `DEBUG` level
+the driver logs every sample; quiet it with a per-driver level:
+
+```yaml
+logger:
+  level: DEBUG
+  logs:
+    qmc5883p: INFO  # or qmc5883l, hmc5883l, mmc5603, mlx90393
+```
+
 ### Substitutions
 
 | Substitution | Default | Meaning |

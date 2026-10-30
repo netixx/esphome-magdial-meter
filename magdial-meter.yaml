@@ -64,11 +64,6 @@ esphome:
           id(magdial_calibration_status).publish_state(
               pair.has_value() && *pair < 3 ? "Ready" : "Not calibrated");
 
-logger:
-  logs:
-    sensor: INFO
-    script: INFO
-
 i2c:
   - id: magdial_i2c
     scl: ${i2c_scl}
