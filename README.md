@@ -211,16 +211,22 @@ Changing **Volume per rotation** keeps Total as it is: the new value applies to 
 
 ## Development
 
-`tests/` holds a config per driver, plus host simulations that run the full logic against a
-simulated rotating magnet with noise and thermal drift, and exit non-zero on failure:
+`tests/` holds:
+
+- `test-*.yaml`: a config per driver, validated with `esphome config`;
+- `replay-real-log*.yaml`: real readings from a QMC5883P on a 10 L/turn meter
+  (`tests/data/real_log_qmc5883p.h`) replayed through the package: calibration must pick x/y
+  and count the 1.75 turns of the log, and a calibration over less than a turn must fail;
+- `sim-*.yaml`: a simulated magnet orbiting close to the sensor, with noise and thermal drift:
+  full run, calibration over a partial turn, long calibration at high flow.
+
+Each replay and simulation compiles for the host and exits non-zero on failure:
 
 ```sh
 pip install esphome
 esphome config tests/test-*.yaml
-esphome compile tests/sim-host.yaml
-(cd tests && .esphome/build/magdial-sim/.pioenvs/magdial-sim/program)
-esphome compile tests/sim-partial-turn.yaml
-(cd tests && .esphome/build/magdial-sim-partial/.pioenvs/magdial-sim-partial/program)
-esphome compile tests/sim-long-calibration.yaml
-(cd tests && .esphome/build/magdial-sim-long/.pioenvs/magdial-sim-long/program)
+for t in replay-real-log:magdial-replay replay-real-log-short:magdial-replay-short \
+         sim-host:magdial-sim sim-partial-turn:magdial-sim-partial sim-long-calibration:magdial-sim-long; do
+  esphome compile tests/${t%%:*}.yaml && (cd tests && .esphome/build/${t##*:}/.pioenvs/${t##*:}/program) || break
+done
 ```

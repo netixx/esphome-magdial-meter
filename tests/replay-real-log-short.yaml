@@ -1,0 +1,10 @@
+---
+# Real data, calibration stopped before one full turn (17-100 s). The y/z pair (Y and Z mirror
+# each other) then shows a bogus 0.97 turn: calibration must still fail as incomplete.
+packages:
+  replay: !include replay-real-log.yaml
+substitutions:
+  replay_name: magdial-replay-short
+  replay_calibration_end: '100'
+  replay_expect_calibration: 'false'
+  replay_expect_failure: 'incomplete turn'

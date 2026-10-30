@@ -43,3 +43,13 @@ jobs:
         run: |
           esphome compile tests/sim-long-calibration.yaml
           cd tests && ./.esphome/build/magdial-sim-long/.pioenvs/magdial-sim-long/program
+
+      - name: Replay real data, calibration and counting
+        run: |
+          esphome compile tests/replay-real-log.yaml
+          cd tests && ./.esphome/build/magdial-replay/.pioenvs/magdial-replay/program
+
+      - name: Replay real data, calibration over less than a turn must fail
+        run: |
+          esphome compile tests/replay-real-log-short.yaml
+          cd tests && ./.esphome/build/magdial-replay-short/.pioenvs/magdial-replay-short/program

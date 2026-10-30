@@ -1,0 +1,133 @@
+---
+# Replays real magnetometer readings (tests/data/real_log_qmc5883p.h) through the package on
+# the host, and exits 0 if the outcome matches the expectation, 1 otherwise:
+#   esphome compile tests/replay-real-log.yaml
+#   tests/.esphome/build/magdial-replay/.pioenvs/magdial-replay/program
+# Pass 1 calibrates between replay_calibration_start and replay_calibration_end (log seconds).
+# If calibration must succeed, pass 2 replays the whole log and checks the turns counted.
+substitutions:
+  replay_name: magdial-replay
+  # The window the device really used: 180 s, about 1.5 turns
+  replay_calibration_start: '17'
+  replay_calibration_end: '197'
+  # true: calibration must succeed, select replay_expect_pair_index (0 x/y, 1 x/z, 2 y/z) and
+  # count between replay_expect_turns_min and _max over the whole log.
+  # false: calibration must fail with a status containing replay_expect_failure.
+  replay_expect_calibration: 'true'
+  replay_expect_pair_index: '0'
+  # Reference: 1.75 turns, computed offline from the same data
+  replay_expect_turns_min: '1.6'
+  replay_expect_turns_max: '1.9'
+  replay_expect_failure: ''
+
+esphome:
+  name: ${replay_name}
+  includes:
+    - data/real_log_qmc5883p.h
+  on_boot:
+    # Host builds keep preferences across runs: start from a clean, uncalibrated state
+    priority: -200
+    then:
+      - number.set:
+          id: magdial_calibration_time
+          value: 3600
+      - select.set:
+          id: magdial_axis_pair
+          option: None
+
+host:
+
+logger:
+  level: DEBUG
+  logs:
+    sensor: INFO
+    text_sensor: INFO
+    select: INFO
+    number: INFO
+    switch: INFO
+    script: INFO
+
+api:
+
+packages:
+  meter: !include ../magdial-meter.yaml
+
+i2c: !remove
+
+sensor:
+  - platform: template
+    id: magnetic_field_x
+    update_interval: never
+  - platform: template
+    id: magnetic_field_y
+    update_interval: never
+  - platform: template
+    id: magnetic_field_z
+    update_interval: never
+    on_raw_value:
+      - script.execute: magdial_process
+
+interval:
+  # 20 interpolated samples per 2 s log row, replayed 10x faster than real time
+  - interval: 10ms
+    startup_delay: 2s
+    then:
+      - lambda: |-
+          static const int N = sizeof(REAL_LOG_QMC5883P) / sizeof(REAL_LOG_QMC5883P[0]);
+          static int pass = 0, row = 0, ticks = 0;
+          static float t = 0;
+          static bool cal_started = false, cal_finished = false;
+          static double rot_start = 0, rot_prev = 0, max_backwards = 0;
+
+          while (row < N - 2 && REAL_LOG_QMC5883P[row + 1][0] <= t) row++;
+          const float *p = REAL_LOG_QMC5883P[row], *q = REAL_LOG_QMC5883P[row + 1];
+          const float f = std::min(1.0f, (t - p[0]) / (q[0] - p[0]));
+          id(magnetic_field_x).publish_state(p[1] + f * (q[1] - p[1]));
+          id(magnetic_field_y).publish_state(p[2] + f * (q[2] - p[2]));
+          id(magnetic_field_z).publish_state(p[3] + f * (q[3] - p[3]));
+          ticks++;
+
+          if (pass == 0) {
+            if (!cal_started && t >= ${replay_calibration_start}) {
+              id(magdial_calibrate).execute();
+              cal_started = true;
+            }
+            if (cal_started && !cal_finished && t >= ${replay_calibration_end}) {
+              id(magdial_cal_finish) = true;
+              cal_finished = true;
+            }
+          } else {
+            // The jump from the end of the log back to its start settles after the median filter
+            const double rot = id(magdial_rotations_total);
+            if (ticks == 3) rot_start = rot_prev = rot;
+            if (ticks > 3) {
+              max_backwards = std::max(max_backwards, rot_prev - rot);
+              rot_prev = rot;
+            }
+          }
+
+          t += 0.1f;
+          if (t <= REAL_LOG_QMC5883P[N - 1][0]) return;
+
+          const std::string status = id(magdial_calibration_status).state;
+          bool ok;
+          if (!${replay_expect_calibration}) {
+            ok = status.rfind("Failed", 0) == 0 && status.find("${replay_expect_failure}") != std::string::npos;
+            ESP_LOGI("replay", "%s: status '%s'", ok ? "PASS" : "FAIL", status.c_str());
+            exit(ok ? 0 : 1);
+          }
+          if (pass == 0) {
+            ESP_LOGI("replay", "Calibration status '%s', replaying the whole log", status.c_str());
+            pass = 1;
+            row = 0;
+            ticks = 0;
+            t = 0;
+            return;
+          }
+          const double turns = id(magdial_rotations_total) - rot_start;
+          ok = status == "Ready" && id(magdial_axis_pair).active_index().value_or(3) == ${replay_expect_pair_index} &&
+               turns >= ${replay_expect_turns_min} && turns <= ${replay_expect_turns_max} && max_backwards < 0.05;
+          ESP_LOGI("replay", "%s: status '%s', pair %s, counted %.3f turns over the log, max backwards step %.3f",
+                   ok ? "PASS" : "FAIL", status.c_str(), id(magdial_axis_pair).current_option().c_str(), turns,
+                   max_backwards);
+          exit(ok ? 0 : 1);
