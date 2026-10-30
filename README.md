@@ -8,9 +8,10 @@ Inspired by [tronikos/esphome-magnetometer-water-gas-meter](https://github.com/t
 which counts half rotations on one axis. This package reconstructs the continuous angle of the dial
 from two axes instead, so it:
 
-- resolves fractions of a turn (1 L steps and better on a 10 L dial, where half-turn counting gives 5 L steps)
+- follows the dial continuously instead of in half-turn (5 L) steps
 - knows the rotation direction, so back-and-forth jitter or back-flow is not counted as consumption
-- selects the axes and the direction automatically during calibration
+- selects the axes and the direction automatically during calibration, and proves a full turn was seen
+- makes no assumption on the shape of the signal (a magnet close to the sensor gives sharp peaks)
 - follows slow temperature drift of the field (adaptive calibration)
 
 ## Installation
@@ -32,6 +33,10 @@ packages:
 preferences:
   flash_write_interval: 5min
 ```
+
+The counter and calibration are saved to flash at most every `flash_write_interval`. On ESP8266
+also set `esp8266: restore_from_flash: true`, otherwise they are kept in RTC memory and lost on
+power loss.
 
 Pick exactly one driver:
 
@@ -73,7 +78,7 @@ logger:
 | `i2c_sda`, `i2c_scl`, `i2c_frequency` | `GPIO4`, `GPIO5`, `50kHz` | I²C bus. Lower the frequency for long cables |
 | `magnetometer_update_interval` | `50ms` | Sampling period, see [Sampling rate](#sampling-rate) |
 | `calibration_seconds_initial_value` | `180` | Initial calibration time. Editable in HA afterwards |
-| `calibration_min_amplitude_initial_value` | `3` | Minimum half-amplitude (µT) of a usable axis. Editable in HA |
+| `calibration_min_amplitude_initial_value` | `10` | Minimum half-amplitude (µT) of a usable axis. Editable in HA |
 | `debug_update_interval` | `2s` | Publish rate of the debug entities to HA |
 | `hide_debug_sensors` | `false` | `true` hides the debug entities from HA |
 | `flow_update_interval` | `10s` | Flow computation period |
@@ -93,16 +98,15 @@ affects a freshly flashed device. Change them in Home Assistant instead.
 | Calibration time | config | Length of the calibration, in s (5 to 3600) |
 | Calibration minimal amplitude | config | Weakest usable axis swing, in µT |
 | Axis pair | config | Axes used for the angle, set by calibration (x/y, x/z, y/z) |
-| Rotation direction | config | Set by calibration. Flip it if Total doesn't increase while water runs |
 | Adaptive calibration | config | Follow slow drift of the field after each complete turn |
 | Calibrate / Finish calibration now / Cancel calibration | config | Buttons |
-| Calibration status | diagnostic | Not calibrated, Calibrating, Detecting direction, Ready, Failed: reason |
-| Calibration details | diagnostic | Selected axes, phase between them, amplitudes |
+| Calibration status | diagnostic | Not calibrated, Calibrating, Ready, Failed: reason |
+| Calibration details | diagnostic | Selected axes, turns seen during calibration, clearance |
 | Magnetic field X / Y / Z | diagnostic | Raw field, averaged over `debug_update_interval` |
 | Magnetic field X / Y / Z min, max | diagnostic | Live extremes while calibrating, calibrated (and adapted) extremes otherwise |
 | Dial angle | diagnostic | Position within the current turn, 0 to 360° |
 | Rotations total | diagnostic | Turns counted since forever, fractional |
-| Signal quality | diagnostic | ~100 % when the calibration fits the signal |
+| Signal clearance | diagnostic | Closest approach of the signal loop to its center over the last turn, in % of the amplitude |
 
 A dashboard card to watch the signal and calibrate (entity IDs for a device named `water-meter`):
 
@@ -119,7 +123,7 @@ cards:
       - button.water_meter_calibrate
       - button.water_meter_finish_calibration_now
       - sensor.water_meter_dial_angle
-      - sensor.water_meter_signal_quality
+      - sensor.water_meter_signal_clearance
   - type: history-graph
     title: Magnetic field
     hours_to_show: 1
@@ -139,34 +143,54 @@ cards:
 
 1. Open a tap with a steady flow.
 2. Press **Calibrate**. The status shows `Calibrating`.
-3. Let the dial make **at least one full turn**. Either wait for **Calibration time** to elapse, or
-   watch the physical dial and press **Finish calibration now** once it has turned fully. The
+3. Let the dial make **more than one full turn**. Either wait for **Calibration time** to elapse,
+   or watch the physical dial and press **Finish calibration now** once it has turned fully. The
    min/max entities grow while calibrating and stop growing once a full turn is covered.
-4. Keep the water running: the status shows `Detecting direction` for about a quarter turn,
-   then `Ready`.
-5. Water used during step 3 is not counted. Use [`set_total`](#setting-the-total) to align Total with the meter.
+4. The status shows `Ready` and counting starts. Water used during calibration is not counted:
+   use [`set_total`](#setting-the-total) to align Total with the meter.
 
 Choose **Calibration time** from your flow: a 10 L dial at 6 L/min needs 100 s per turn, so the
 default 180 s leaves margin. Slower flow or a bigger dial needs a longer time (up to 3600 s).
 
-Calibration records the min/max of every axis, and where the other axes were at each extreme. A
-rotating magnet makes each axis a sinusoid of the dial angle with its own offset, amplitude and
-phase; from those it picks the pair of axes with the largest usable signal (weaker amplitude ×
-sin(phase between them)). Two axes swinging in phase carry no direction information, so the pair
-with the strongest *out-of-phase* signal wins, not simply the two strongest axes.
+### How it works
+
+Each turn of the magnet makes the field vector trace a closed loop. Seen through a pair of axes,
+each normalised by its min/max, the loop goes once around its center per turn, and the angle
+around the center follows the dial. Calibration records the loop and, for each axis pair,
+measures:
+
+- the **winding**: how many times the loop went around its center. At least one full turn is
+  required, and its sign gives the rotation direction (water flows forward while calibrating);
+- the **clearance**: how close the loop comes to its center. Noise near the center would make
+  the angle jump, so the pair with the largest clearance wins.
+
+**Why two axes, not one?** One axis alone (as in tronikos' package) can only count threshold
+crossings: half a turn (5 L) per step, no direction, and the same value occurs at two angles. Two
+axes give the position within the turn and its direction. They must not swing in phase: on a
+real meter two axes often mirror each other (in a test log, Y and Z: clearance 1 %), which makes
+a flat loop through the center. That pair is useless even if both axes swing strongly, which is
+why the pair is chosen by clearance and not by amplitude.
+
+**Accuracy within a turn**: a magnet close to the sensor gives a non-uniform signal, so the angle
+advances faster on some parts of the turn than others. The count of turns is exact, but within a
+turn Total can lead or lag by up to ~0.2 turn (2 L on a 10 L dial). It never accumulates.
 
 | Status | Fix |
 | --- | --- |
 | `Failed: no magnetometer data` | Check wiring, I²C address and the log |
 | `Failed: low signal...` | Move the sensor closer to the magnet, or lower **Calibration minimal amplitude** |
 | `Failed: axes swing in phase...` | Rotate the sensor ~45° on the meter |
-| `Failed: incomplete turn...` | Run more water or raise **Calibration time** |
+| `Failed: incomplete turn (x seen)...` | Run more water or raise **Calibration time** |
 
-A failed calibration keeps the previous one. **Cancel calibration** also restores the previous one.
+A failed or cancelled calibration keeps the previous one. The device log lists, per pair, the
+turns seen and the clearance.
 
-**Signal quality** drifting well away from 100 % means the field changed (sensor moved, big
-temperature change): recalibrate. **Adaptive calibration** corrects slow drift by itself, after
-each complete turn whose extremes are within 30 % of the calibration.
+**Calibration minimal amplitude** (default 10 µT half-amplitude) only filters out axes that
+barely move: raw sensor noise is ~1 µT, and a magnet near the sensor gives hundreds of µT.
+
+**Signal clearance** falling toward 0 means the field changed (sensor moved, big temperature
+change): recalibrate. **Adaptive calibration** corrects slow drift by itself, after each complete
+turn whose extremes are within 30 % of the calibration.
 
 ## Sampling rate
 
@@ -183,8 +207,7 @@ A 10 L dial at 60 L/min turns once per 10 s: 50 ms gives 200 samples per turn. A
 To make Total match the meter, in Home Assistant go to **Developer tools** >
 **Actions**, run `esphome.water_meter_set_total` with `new_total` set to the meter reading.
 
-After changing **Volume per rotation**, run `set_total` again. Total never decreases, so a smaller
-value would otherwise freeze Total until consumption catches up.
+Changing **Volume per rotation** keeps Total as it is: the new value applies to turns from then on.
 
 ## Development
 
@@ -198,4 +221,6 @@ esphome compile tests/sim-host.yaml
 (cd tests && .esphome/build/magdial-sim/.pioenvs/magdial-sim/program)
 esphome compile tests/sim-partial-turn.yaml
 (cd tests && .esphome/build/magdial-sim-partial/.pioenvs/magdial-sim-partial/program)
+esphome compile tests/sim-long-calibration.yaml
+(cd tests && .esphome/build/magdial-sim-long/.pioenvs/magdial-sim-long/program)
 ```

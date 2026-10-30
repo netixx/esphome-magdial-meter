@@ -1,0 +1,9 @@
+---
+# A long calibration at high flow fills the trajectory buffer: it must finish early
+# by itself and still count correctly.
+packages:
+  sim: !include sim-host.yaml
+substitutions:
+  sim_name: magdial-sim-long
+  calibration_seconds_initial_value: '3600'
+  sim_calibration_rate: '1.0'

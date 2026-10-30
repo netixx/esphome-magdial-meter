@@ -7,3 +7,4 @@ substitutions:
   calibration_seconds_initial_value: '2'
   sim_duration_seconds: '20'
   sim_expect_calibration: 'false'
+  sim_expect_failure: 'incomplete turn'

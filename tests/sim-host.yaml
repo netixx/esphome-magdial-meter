@@ -10,13 +10,27 @@ substitutions:
   sim_name: magdial-sim
   sim_duration_seconds: '170'
   # true: calibration must succeed and counting stay within sim_max_error_turns.
-  # false: calibration must fail.
+  # false: calibration must fail with a status containing sim_expect_failure.
   sim_expect_calibration: 'true'
-  # Within-turn error under the exaggerated drift below; it must not accumulate.
+  sim_expect_failure: ''
+  # Flow in turns per second while calibrating (and until t=60 s)
+  sim_calibration_rate: '0.2'
+  # Checked each time the simulated dial is back where counting started: there the
+  # within-turn non-linearity cancels, so the count must match the simulated turns.
   sim_max_error_turns: '0.1'
 
 esphome:
   name: ${sim_name}
+  on_boot:
+    # Host builds keep preferences across runs: start from a clean, uncalibrated state
+    priority: -200
+    then:
+      - number.set:
+          id: magdial_calibration_time
+          value: ${calibration_seconds_initial_value}
+      - select.set:
+          id: magdial_axis_pair
+          option: None
 
 host:
 
@@ -41,9 +55,6 @@ globals:
   - id: sim_turns
     type: double
     initial_value: '0'
-  - id: sim_seen_calibration
-    type: bool
-    initial_value: 'false'
   - id: sim_turns_at_ready
     type: double
     initial_value: 'NAN'
@@ -53,6 +64,22 @@ globals:
   - id: sim_max_error
     type: double
     initial_value: '0'
+  - id: sim_checks
+    type: int
+    initial_value: '0'
+  # Rotations at calibration start, and whether they changed during calibration
+  - id: sim_rot_at_cal
+    type: double
+    initial_value: 'NAN'
+  - id: sim_counted_during_cal
+    type: bool
+    initial_value: 'false'
+  - id: sim_turns_at_cal
+    type: double
+    initial_value: 'NAN'
+  - id: sim_turns_after_cal
+    type: double
+    initial_value: 'NAN'
 
 sensor:
   - platform: template
@@ -74,50 +101,87 @@ interval:
           // Host millis() does not start at 0
           static const uint32_t start = millis();
           const float t = (millis() - start) / 1000.0f;
-          // Flow profile in turns per second (the magnet spins "backwards" to exercise direction detection)
+          // Flow profile in turns per second (the magnet spins "backwards" to exercise the direction sign)
           float rate = 0;
-          if (t > 5 && t < 60) rate = -0.2f;         // calibration + direction detection
+          if (t > 1 && t < 60) rate = -${sim_calibration_rate};  // calibration (from t=3 s), then counting
           else if (t > 70 && t < 100) rate = -0.5f;  // fast flow
           else if (t > 110 && t < 160) rate = -0.03f;  // slow flow
           id(sim_turns) += rate * 0.05;
+          // Dipole magnet orbiting 6 mm off the dial axis, 14 mm from the sensor: sharp,
+          // far from sinusoidal peaks, and the x/z pair swings in phase (like real meters).
           const float th = 2.0f * M_PI * id(sim_turns);
-          // Thermal drift of the offsets (much faster than real), plus noise
+          const float m[3] = {cosf(th + 0.6f), sinf(th + 0.6f), 0.25f};
+          const float r[3] = {14.0f - 6.0f * cosf(th), -6.0f * sinf(th), 8.0f};
+          const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+          const float md = (m[0] * r[0] + m[1] * r[1] + m[2] * r[2]) / rn;
+          float f[3];
+          for (int i = 0; i < 3; i++) f[i] = 6e5f * (3 * md * r[i] / rn - m[i]) / (rn * rn * rn);
+          // Earth field, thermal drift of the offsets (much faster than real), noise
           const float drift = 4.0f * sinf(t / 40.0f);
           auto noise = []() { return (random_float() - 0.5f) * 1.5f; };
-          id(magnetic_field_x).publish_state(20 + drift + 25 * cosf(th) + noise());
-          id(magnetic_field_y).publish_state(-40 + 15 * cosf(th - 1.0f) + noise());
-          id(magnetic_field_z).publish_state(5 - drift + 30 * cosf(th + 2.5f) + noise());
+          id(magnetic_field_x).publish_state(20 + drift + f[0] + noise());
+          id(magnetic_field_y).publish_state(-5 + f[1] + noise());
+          id(magnetic_field_z).publish_state(40 - drift + f[2] + noise());
+
+          // Water used during calibration must not be counted
+          if (id(magdial_cal_phase) == 1) {
+            if (std::isnan(id(sim_rot_at_cal))) {
+              id(sim_rot_at_cal) = id(magdial_rotations_total);
+              id(sim_turns_at_cal) = id(sim_turns);
+            } else if (id(magdial_rotations_total) != id(sim_rot_at_cal)) {
+              id(sim_counted_during_cal) = true;
+            }
+            id(sim_turns_after_cal) = id(sim_turns);
+          }
+
+          // Counting starts once this run's own calibration is Ready
+          if (id(magdial_cal_samples) == 0 || id(magdial_calibration_status).state != "Ready") return;
+          if (std::isnan(id(sim_turns_at_ready))) {
+            id(sim_turns_at_ready) = id(sim_turns);
+            id(sim_rot_at_ready) = id(magdial_rotations_total);
+          }
+          static double last_sim = 0;
+          const double sim = -(id(sim_turns) - id(sim_turns_at_ready));
+          if (floor(sim) != floor(last_sim)) {  // dial back at the starting position
+            const double err = id(magdial_rotations_total) - id(sim_rot_at_ready) - sim;
+            id(sim_max_error) = std::max(id(sim_max_error), fabs(err));
+            id(sim_checks)++;
+            ESP_LOGI("sim", "turn %.0f: error %.3f turn", floor(sim), err);
+          }
+          last_sim = sim;
 
   - interval: 5s
     then:
       - lambda: |-
           static const uint32_t start = millis();
           const uint32_t t = (millis() - start) / 1000;
-          if (id(magdial_cal_phase) != 0) id(sim_seen_calibration) = true;
-          const bool ready = id(magdial_calibration_status).state == "Ready";
-          // Baseline once this run's own calibration has completed
-          if (std::isnan(id(sim_turns_at_ready)) && id(sim_seen_calibration) && ready) {
-            id(sim_turns_at_ready) = id(sim_turns);
-            id(sim_rot_at_ready) = id(magdial_rotations_total);
-          }
           if (!std::isnan(id(sim_turns_at_ready))) {
             const double sim = -(id(sim_turns) - id(sim_turns_at_ready));
             const double got = id(magdial_rotations_total) - id(sim_rot_at_ready);
-            id(sim_max_error) = std::max(id(sim_max_error), fabs(got - sim));
-            ESP_LOGI("sim", "t=%us simulated %.3f turns, counted %.3f, error %.3f, quality %.0f%%, flow %.2f",
-                     t, sim, got, got - sim, id(magdial_signal_quality) * 100, id(magdial_flow).state);
+            ESP_LOGI("sim", "t=%us simulated %.3f turns, counted %.3f, clearance %.0f%%, flow %.2f", t, sim, got,
+                     id(magdial_clearance) * 100, id(magdial_flow).state);
           }
           if (t < ${sim_duration_seconds}) return;
 
           const std::string status = id(magdial_calibration_status).state;
           bool ok;
           if (${sim_expect_calibration}) {
-            ok = !std::isnan(id(sim_turns_at_ready)) && id(sim_max_error) < ${sim_max_error_turns};
+            // Calibration must have seen the turns that really happened while recording (within the
+            // within-turn non-linearity at its start and end points)
+            const double cal_turns = fabs(id(sim_turns_after_cal) - id(sim_turns_at_cal));
+            ESP_LOGI("sim", "Calibration saw %.2f turns, simulated %.2f", id(magdial_cal_turns), cal_turns);
+            ok = id(sim_checks) >= 5 && id(sim_max_error) < ${sim_max_error_turns} &&
+                 fabs(id(magdial_cal_turns) - cal_turns) < 0.6;
           } else {
-            ok = id(sim_seen_calibration) && status.rfind("Failed", 0) == 0;
+            ok = id(magdial_cal_samples) > 0 && status.rfind("Failed", 0) == 0 &&
+                 status.find("${sim_expect_failure}") != std::string::npos;
           }
-          ESP_LOGI("sim", "%s: status '%s', max error %.3f turns", ok ? "PASS" : "FAIL", status.c_str(),
-                   id(sim_max_error));
+          if (id(sim_counted_during_cal)) {
+            ESP_LOGE("sim", "Water was counted during calibration");
+            ok = false;
+          }
+          ESP_LOGI("sim", "%s: status '%s', %d turn checks, max error %.3f turn", ok ? "PASS" : "FAIL",
+                   status.c_str(), id(sim_checks), id(sim_max_error));
           exit(ok ? 0 : 1);
 
   - interval: 1h

@@ -7,6 +7,8 @@ sensor:
     update_interval: ${magnetometer_update_interval}
     address: 0x1E
     oversampling: 8x
+    # Widest range: a magnet close to the sensor easily exceeds the 130µT default
+    range: 810µT
     field_strength_x:
       id: magnetic_field_x
       name: Magnetic field X

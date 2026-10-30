@@ -38,3 +38,8 @@ jobs:
         run: |
           esphome compile tests/sim-partial-turn.yaml
           cd tests && ./.esphome/build/magdial-sim-partial/.pioenvs/magdial-sim-partial/program
+
+      - name: Simulation, long calibration must finish early and count correctly
+        run: |
+          esphome compile tests/sim-long-calibration.yaml
+          cd tests && ./.esphome/build/magdial-sim-long/.pioenvs/magdial-sim-long/program

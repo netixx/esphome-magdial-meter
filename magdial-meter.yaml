@@ -6,13 +6,15 @@
 # magnetometer sensor. See README.md.
 #
 # How it works:
-#   A rotating magnet makes each axis of the field a sinusoid of the dial angle,
-#   each with its own offset, amplitude and phase. Calibration records, over at
-#   least one full turn, the min/max of every axis (giving offset and amplitude)
-#   and the value of the other axes at each extreme (giving the phase between
-#   axes). It then picks the axis pair with the strongest usable signal, and the
-#   dial angle is reconstructed continuously from that pair. Unlike counting
-#   threshold crossings, this resolves fractions of a turn.
+#   Each turn of the magnet makes the field vector trace a closed loop. Seen
+#   through a pair of axes, normalised by their min/max, the loop goes once
+#   around its center per turn, so the angle around the center tracks the dial
+#   continuously. Calibration records the loop over at least one full turn and
+#   picks the axis pair whose loop stays farthest from its center (best noise
+#   margin). The number of times that loop winds around the center proves a full
+#   turn was seen, and its sign gives the rotation direction. No assumption is
+#   made on the shape of the signal: a magnet close to the sensor gives sharp,
+#   far from sinusoidal peaks, which is fine.
 
 substitutions:
   # For water one of: CCF, ft³, gal, L, m³
@@ -37,8 +39,8 @@ substitutions:
   volume_per_rotation_initial_value: '10'
   # Calibration must cover at least one full turn: at 6 L/min a 10 L dial needs 100 s.
   calibration_seconds_initial_value: '180'
-  # Minimum half-amplitude (µT) an axis must swing to be usable.
-  calibration_min_amplitude_initial_value: '3'
+  # Minimum half-amplitude (µT) an axis must swing to be usable. Raw sensor noise is ~1 µT.
+  calibration_min_amplitude_initial_value: '10'
 
   # Publish rate of the debug entities (raw field per axis, dial angle, ...).
   # The algorithm always uses every sample; this only limits Home Assistant traffic.
@@ -59,10 +61,7 @@ esphome:
   on_boot:
     priority: -100
     then:
-      - lambda: |-
-          auto pair = id(magdial_axis_pair).active_index();
-          id(magdial_calibration_status).publish_state(
-              pair.has_value() && *pair < 3 ? "Ready" : "Not calibrated");
+      - script.execute: magdial_publish_status
 
 i2c:
   - id: magdial_i2c
@@ -95,6 +94,11 @@ globals:
     type: double
     restore_value: true
     initial_value: '0'
+  # Volume per rotation the offset was computed with, to keep Total when it changes
+  - id: magdial_volume_per_rotation_applied
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
   # Highest Total ever published: Total is total_increasing and must never go down.
   - id: magdial_total_published
     type: double
@@ -108,13 +112,15 @@ globals:
   - id: magdial_amplitude
     type: std::array<float, 3>
     restore_value: true
-  # Cosine of the phase between the axes of each pair x/y, x/z, y/z.
-  - id: magdial_pair_cos
+  # Rotation direction (+1/-1) of each pair x/y, x/z, y/z, from the calibration winding.
+  # 0: the pair failed validation and is never used for counting.
+  - id: magdial_pair_sign
     type: std::array<float, 3>
     restore_value: true
+    initial_value: '{{0, 0, 0}}'
 
   # --- Calibration runtime state ---
-  # 0 idle, 1 recording extremes, 2 detecting rotation direction
+  # 0 idle, 1 recording
   - id: magdial_cal_phase
     type: int
     initial_value: '0'
@@ -128,31 +134,17 @@ globals:
     type: std::array<float, 3>
   - id: magdial_cal_hi
     type: std::array<float, 3>
-  # [i * 3 + j]: value of axis j at the moment axis i reached its min (lo) / max (hi)
-  - id: magdial_cal_at_lo
-    type: std::array<float, 9>
-  - id: magdial_cal_at_hi
-    type: std::array<float, 9>
-  - id: magdial_direction_acc
+  # Trajectory of the field during calibration in 0.1 µT units, at most 400 points
+  - id: magdial_cal_points
+    type: std::vector<std::array<int16_t, 3>>
+  # Grows x2 each time the trajectory is thinned
+  - id: magdial_cal_thin
+    type: float
+    initial_value: '1'
+  # Turns seen by the last successful calibration (diagnostic)
+  - id: magdial_cal_turns
     type: float
     initial_value: '0'
-  # Mean radius of the reconstructed angle vector while detecting direction
-  - id: magdial_direction_radius_sum
-    type: float
-    initial_value: '0'
-  - id: magdial_direction_samples
-    type: uint32_t
-    initial_value: '0'
-  # Previous calibration, restored if the new one fails validation
-  - id: magdial_prev_center
-    type: std::array<float, 3>
-  - id: magdial_prev_amplitude
-    type: std::array<float, 3>
-  - id: magdial_prev_pair_cos
-    type: std::array<float, 3>
-  - id: magdial_prev_pair
-    type: size_t
-    initial_value: '3'
 
   # --- Tracking runtime state ---
   - id: magdial_have_last
@@ -162,10 +154,14 @@ globals:
   - id: magdial_last_angle
     type: float
     initial_value: '0'
-  # Smoothed radius of the reconstructed angle vector, 1.0 = perfect calibration
-  - id: magdial_signal_quality
+  # Smallest distance of the loop from its center over the last complete turn
+  # (1.0 = the amplitude). Noise must stay well below it.
+  - id: magdial_clearance
     type: float
-    initial_value: '1'
+    initial_value: 'NAN'
+  - id: magdial_turn_clearance
+    type: float
+    initial_value: 'NAN'
   # Per-turn extremes for adaptive calibration
   - id: magdial_turn_lo
     type: std::array<float, 3>
@@ -192,6 +188,14 @@ number:
     unit_of_measurement: ${volume_unit}
     restore_value: true
     optimistic: true
+    on_value:
+      - lambda: |-
+          // Keep Total unchanged: the new value only applies to turns from now on.
+          const float prev = id(magdial_volume_per_rotation_applied);
+          if (!std::isnan(prev) && prev != x) {
+            id(magdial_volume_offset) += id(magdial_rotations_total) * (prev - x);
+          }
+          id(magdial_volume_per_rotation_applied) = x;
 
   - platform: template
     id: magdial_calibration_time
@@ -235,20 +239,7 @@ select:
     on_value:
       - lambda: |-
           id(magdial_have_last) = false;  // angle mapping changed, re-sync
-          if (id(magdial_cal_phase) == 0) {
-            id(magdial_calibration_status).publish_state(i < 3 ? "Ready" : "Not calibrated");
-          }
-
-  # Set by calibration; flip it if Total does not increase while water runs.
-  - platform: template
-    id: magdial_direction
-    name: Rotation direction
-    entity_category: config
-    icon: mdi:rotate-right
-    options: [Normal, Reversed]
-    initial_option: Normal
-    restore_value: true
-    optimistic: true
+          if (id(magdial_cal_phase) == 0) id(magdial_publish_status).execute();
 
 switch:
   - platform: template
@@ -281,18 +272,13 @@ button:
     on_press:
       - script.stop: magdial_calibrate
       - lambda: |-
-          if (id(magdial_cal_phase) == 2) {  // new calibration not validated yet: roll back
-            id(magdial_center) = id(magdial_prev_center);
-            id(magdial_amplitude) = id(magdial_prev_amplitude);
-            id(magdial_pair_cos) = id(magdial_prev_pair_cos);
-            id(magdial_cal_phase) = 0;
-            id(magdial_axis_pair).make_call().set_index(id(magdial_prev_pair)).perform();
-          }
+          if (id(magdial_cal_phase) == 0) return;  // nothing running: keep the current status
           id(magdial_cal_phase) = 0;
+          id(magdial_cal_points).clear();
+          id(magdial_cal_points).shrink_to_fit();
           id(magdial_have_last) = false;
-          auto pair = id(magdial_axis_pair).active_index();
-          id(magdial_calibration_status).publish_state(
-              pair.has_value() && *pair < 3 ? "Ready" : "Not calibrated");
+          ESP_LOGI("magdial", "Calibration cancelled, previous calibration kept");
+          id(magdial_publish_status).execute();
 
 text_sensor:
   - platform: template
@@ -310,30 +296,86 @@ text_sensor:
     update_interval: never
 
 script:
+  - id: magdial_publish_status
+    then:
+      - lambda: |-
+          auto pair = id(magdial_axis_pair).active_index();
+          const bool ready = pair.has_value() && *pair < 3 && id(magdial_pair_sign)[*pair] != 0;
+          id(magdial_calibration_status).publish_state(ready ? "Ready" : "Not calibrated");
+
   # Called by the driver for every magnetometer sample, after X, Y and Z are published.
   - id: magdial_process
     mode: single
     then:
       - lambda: |-
-          const float v[3] = {id(magnetic_field_x).get_raw_state(), id(magnetic_field_y).get_raw_state(),
-                              id(magnetic_field_z).get_raw_state()};
-          if (std::isnan(v[0]) || std::isnan(v[1]) || std::isnan(v[2])) return;
+          const float raw[3] = {id(magnetic_field_x).get_raw_state(), id(magnetic_field_y).get_raw_state(),
+                                id(magnetic_field_z).get_raw_state()};
+          if (std::isnan(raw[0]) || std::isnan(raw[1]) || std::isnan(raw[2])) return;
+          // Median of the last 3 samples per axis: a single glitch (e.g. I2C error on a long
+          // cable) would otherwise inflate the calibration min/max for good.
+          static float hist[3][2];
+          static int n_hist = 0;
+          float v[3];
+          for (int i = 0; i < 3; i++) {
+            const float a = n_hist >= 2 ? hist[i][0] : raw[i], b = n_hist >= 1 ? hist[i][1] : raw[i], c = raw[i];
+            v[i] = std::max(std::min(a, b), std::min(std::max(a, b), c));
+            hist[i][0] = hist[i][1];
+            hist[i][1] = c;
+          }
+          if (n_hist < 2) n_hist++;
 
-          // --- Calibration: record the extremes of each axis, and where the other axes were then ---
+          // --- Calibration: record the extremes of each axis and the trajectory of the field ---
           if (id(magdial_cal_phase) == 1) {
             auto &lo = id(magdial_cal_lo);
             auto &hi = id(magdial_cal_hi);
             for (int i = 0; i < 3; i++) {
-              if (v[i] > hi[i]) {
-                hi[i] = v[i];
-                for (int j = 0; j < 3; j++) id(magdial_cal_at_hi)[i * 3 + j] = v[j];
-              }
-              if (v[i] < lo[i]) {
-                lo[i] = v[i];
-                for (int j = 0; j < 3; j++) id(magdial_cal_at_lo)[i * 3 + j] = v[j];
-              }
+              lo[i] = std::min(lo[i], v[i]);
+              hi[i] = std::max(hi[i], v[i]);
             }
             id(magdial_cal_samples)++;
+            // Keep a point each time an axis moved 1 % of its own range (x thin): a few hundred
+            // per turn. Axes that barely move (below the minimal amplitude) do not trigger it.
+            auto &pts = id(magdial_cal_points);
+            const float min_span = 2.0f * id(magdial_calibration_min_amplitude).state;
+            auto moved = [&](const float *from, const float *to) {
+              for (int i = 0; i < 3; i++) {
+                const float step = std::max(hi[i] - lo[i], min_span) / 100.0f * id(magdial_cal_thin);
+                if (fabsf(to[i] - from[i]) >= step) return true;
+              }
+              return false;
+            };
+            auto unpack = [](const std::array<int16_t, 3> &q, float *out) {
+              for (int i = 0; i < 3; i++) out[i] = q[i] * 0.1f;
+            };
+            if (!pts.empty()) {
+              float last[3];
+              unpack(pts.back(), last);
+              if (!moved(last, v)) return;
+            }
+            // Full: double the step and re-decimate with it. Consecutive points then stay within
+            // one step plus one sample apart (at most 16 % of an amplitude per axis at thin 8),
+            // so the winding stays exact for any loop with >= 20 % clearance. Past thin 8 the
+            // buffer already holds 10+ turns: finish instead.
+            while (pts.size() >= 400 && id(magdial_cal_thin) < 8) {
+              id(magdial_cal_thin) *= 2;
+              size_t k = 1;
+              float kept[3], cur[3];
+              unpack(pts[0], kept);
+              for (size_t j = 1; j < pts.size(); j++) {
+                unpack(pts[j], cur);
+                if (j + 1 == pts.size() || moved(kept, cur)) {
+                  pts[k++] = pts[j];
+                  unpack(pts[j], kept);
+                }
+              }
+              pts.resize(k);
+            }
+            if (pts.size() >= 400) {
+              id(magdial_cal_finish) = true;
+              return;
+            }
+            auto q16 = [](float f) { return (int16_t) std::max(-32768.0f, std::min(32767.0f, roundf(f * 10.0f))); };
+            pts.push_back({q16(v[0]), q16(v[1]), q16(v[2])});
             return;
           }
 
@@ -343,21 +385,19 @@ script:
           const int p = *pair, a = AXES[p][0], b = AXES[p][1];
           auto &center = id(magdial_center);
           auto &amp = id(magdial_amplitude);
-          if (amp[a] <= 0 || amp[b] <= 0) return;
+          if (amp[a] <= 0 || amp[b] <= 0 || id(magdial_pair_sign)[p] == 0) return;  // pair not validated
 
-          // --- Dial angle: na = cos(t), nb = cos(t - delta)  =>  sin(t) = (nb - na cos(delta)) / sin(delta) ---
+          // --- Dial angle: angle of the normalised field around the center of its loop ---
           const float na = (v[a] - center[a]) / amp[a];
           const float nb = (v[b] - center[b]) / amp[b];
-          const float cd = id(magdial_pair_cos)[p];
-          const float sd = sqrtf(std::max(1e-4f, 1.0f - cd * cd));
-          const float s = (nb - na * cd) / sd;
-          const float angle = atan2f(s, na) / (2.0f * static_cast<float>(M_PI));  // -0.5..0.5 turn
-          id(magdial_signal_quality) = 0.98f * id(magdial_signal_quality) + 0.02f * sqrtf(na * na + s * s);
+          const float radius = sqrtf(na * na + nb * nb);
+          const float angle = atan2f(nb, na) / (2.0f * static_cast<float>(M_PI));  // -0.5..0.5 turn
 
           if (!id(magdial_have_last)) {
             id(magdial_last_angle) = angle;
             id(magdial_have_last) = true;
             id(magdial_turn_tracking) = false;
+            id(magdial_turn_clearance) = radius;
             id(magdial_last_full_turn) = floor(id(magdial_rotations_total));
             return;
           }
@@ -369,41 +409,8 @@ script:
             ESP_LOGW("magdial", "Dial moved %.0f° between two samples, turns may be missed: "
                      "lower magnetometer_update_interval", fabsf(d) * 360.0f);
           }
-
-          // --- Direction detection after calibration: water flows forward, so the sign of motion tells ---
-          if (id(magdial_cal_phase) == 2) {
-            id(magdial_direction_acc) += d;
-            id(magdial_direction_radius_sum) += sqrtf(na * na + s * s);
-            id(magdial_direction_samples)++;
-            const float acc = id(magdial_direction_acc);
-            if (fabsf(acc) >= 0.25f) {
-              // Outside the arc seen during calibration, a calibration from a partial turn
-              // reconstructs a vector far from the unit circle: reject it.
-              const float radius = id(magdial_direction_radius_sum) / id(magdial_direction_samples);
-              if (radius < 0.75f || radius > 1.25f) {
-                ESP_LOGE("magdial", "Calibration failed: signal radius %.2f instead of 1, the calibration did not "
-                         "cover a full turn. Previous calibration restored", radius);
-                id(magdial_center) = id(magdial_prev_center);
-                id(magdial_amplitude) = id(magdial_prev_amplitude);
-                id(magdial_pair_cos) = id(magdial_prev_pair_cos);
-                id(magdial_cal_phase) = 0;
-                id(magdial_axis_pair).make_call().set_index(id(magdial_prev_pair)).perform();
-                id(magdial_calibration_status).publish_state("Failed: incomplete turn, run more water or raise the calibration time");
-                return;
-              }
-              id(magdial_direction).make_call().set_index(acc < 0 ? 1 : 0).perform();
-              id(magdial_rotations_total) += fabsf(acc);  // count the water used to detect it
-              id(magdial_cal_phase) = 0;
-              id(magdial_turn_tracking) = false;
-              id(magdial_last_full_turn) = floor(id(magdial_rotations_total));
-              id(magdial_calibration_status).publish_state("Ready");
-              ESP_LOGI("magdial", "Calibration complete, rotation direction: %s", acc < 0 ? "Reversed" : "Normal");
-            }
-            return;
-          }
-
-          if (id(magdial_direction).active_index().value_or(0) == 1) d = -d;
-          id(magdial_rotations_total) += d;
+          id(magdial_rotations_total) += d * id(magdial_pair_sign)[p];
+          id(magdial_turn_clearance) = std::min(id(magdial_turn_clearance), radius);
 
           // --- Adaptive calibration: after each complete forward turn, nudge toward observed extremes ---
           auto &tlo = id(magdial_turn_lo);
@@ -430,6 +437,8 @@ script:
                 ESP_LOGD("magdial", "Turn extremes too far from calibration, not adapting");
               }
             }
+            if (id(magdial_turn_tracking)) id(magdial_clearance) = id(magdial_turn_clearance);
+            id(magdial_turn_clearance) = radius;
             id(magdial_turn_tracking) = true;
             id(magdial_last_full_turn) = turn;
             for (int i = 0; i < 3; i++) tlo[i] = thi[i] = v[i];
@@ -443,6 +452,9 @@ script:
           id(magdial_cal_lo).fill(std::numeric_limits<float>::max());
           id(magdial_cal_hi).fill(std::numeric_limits<float>::lowest());
           id(magdial_cal_samples) = 0;
+          id(magdial_cal_points).clear();
+          id(magdial_cal_points).reserve(400);
+          id(magdial_cal_thin) = 1;
           id(magdial_cal_finish) = false;
           id(magdial_cal_phase) = 1;
           id(magdial_calibration_status).publish_state("Calibrating: run water for at least one full turn");
@@ -452,9 +464,12 @@ script:
           timeout: !lambda return id(magdial_calibration_time).state * 1000;
       - lambda: |-
           id(magdial_cal_phase) = 0;
-          auto fail = [](const char *msg) {
-            ESP_LOGE("magdial", "Calibration failed: %s", msg);
-            id(magdial_calibration_status).publish_state(std::string("Failed: ") + msg);
+          // Moved out so the buffer is freed whatever the outcome
+          const std::vector<std::array<int16_t, 3>> pts = std::move(id(magdial_cal_points));
+          id(magdial_cal_points) = {};
+          auto fail = [](const std::string &msg) {
+            ESP_LOGE("magdial", "Calibration failed: %s", msg.c_str());
+            id(magdial_calibration_status).publish_state("Failed: " + msg);
             id(magdial_have_last) = false;
           };
           if (id(magdial_cal_samples) < 10) {
@@ -464,78 +479,97 @@ script:
 
           const auto &lo = id(magdial_cal_lo);
           const auto &hi = id(magdial_cal_hi);
-          const auto &at_lo = id(magdial_cal_at_lo);
-          const auto &at_hi = id(magdial_cal_at_hi);
           const char *AXIS = "xyz";
           static const int AXES[3][2] = {{0, 1}, {0, 2}, {1, 2}};
-          std::array<float, 3> center, amp, pair_cos{};
+          std::array<float, 3> center, amp;
           for (int i = 0; i < 3; i++) {
             center[i] = (hi[i] + lo[i]) / 2.0f;
             amp[i] = (hi[i] - lo[i]) / 2.0f;
-            ESP_LOGI("magdial", "%c: min %.2f max %.2f amplitude %.2f µT", AXIS[i], lo[i], hi[i], amp[i]);
+            ESP_LOGI("magdial", "%c: min %.1f max %.1f amplitude %.1f µT", AXIS[i], lo[i], hi[i], amp[i]);
           }
+          ESP_LOGI("magdial", "%u samples, %u trajectory points%s", (unsigned) id(magdial_cal_samples),
+                   (unsigned) pts.size(), pts.size() >= 400 ? " (buffer full, finished early)" : "");
 
-          // Pick the pair with the largest usable amplitude: the weaker axis times sin(phase).
-          // Two axes in phase carry the same information and cannot give a direction.
+          // For each pair: how often the normalised loop winds around its center (turns seen,
+          // signed by the direction), and how close it comes to the center (noise margin).
           const float min_amp = id(magdial_calibration_min_amplitude).state;
-          int best = -1;
-          float best_quality = 0, best_spread = 0;
+          std::array<float, 3> winding{}, clearance{};
+          int best = -1, usable = 0;
+          float best_score = 0;
           for (int p = 0; p < 3; p++) {
             const int a = AXES[p][0], b = AXES[p][1];
-            if (amp[a] < min_amp || amp[b] < min_amp) continue;
-            auto n = [&](int axis, float value) { return (value - center[axis]) / amp[axis]; };
-            // Four estimates of cos(phase): b at a's max and min, a at b's max and min.
-            const float e[4] = {n(b, at_hi[a * 3 + b]), -n(b, at_lo[a * 3 + b]),
-                                n(a, at_hi[b * 3 + a]), -n(a, at_lo[b * 3 + a])};
-            const float cd = std::max(-1.0f, std::min(1.0f, (e[0] + e[1] + e[2] + e[3]) / 4.0f));
-            const float spread = *std::max_element(e, e + 4) - *std::min_element(e, e + 4);
-            const float quality = std::min(amp[a], amp[b]) * sqrtf(1.0f - cd * cd);
-            pair_cos[p] = cd;
-            ESP_LOGI("magdial", "%c/%c: phase %.0f°, usable amplitude %.2f µT, consistency spread %.2f",
-                     AXIS[a], AXIS[b], acosf(cd) * 180.0f / static_cast<float>(M_PI), quality, spread);
-            if (quality > best_quality) {
+            if (amp[a] < min_amp || amp[b] < min_amp) {
+              ESP_LOGI("magdial", "%c/%c: amplitude below %.1f µT", AXIS[a], AXIS[b], min_amp);
+              continue;
+            }
+            usable++;
+            float w = 0, clear = 1e9f, last = NAN;
+            for (const auto &q : pts) {
+              const float na = (q[a] * 0.1f - center[a]) / amp[a], nb = (q[b] * 0.1f - center[b]) / amp[b];
+              clear = std::min(clear, sqrtf(na * na + nb * nb));
+              const float ang = atan2f(nb, na) / (2.0f * static_cast<float>(M_PI));
+              if (!std::isnan(last)) w += ang - last - roundf(ang - last);
+              last = ang;
+            }
+            winding[p] = w;
+            clearance[p] = clear;
+            // Score: clearance in µT. Axes swinging in phase make a flat loop that passes
+            // through its center and cannot be tracked.
+            const float score = clear * std::min(amp[a], amp[b]);
+            ESP_LOGI("magdial", "%c/%c: %+.2f turns, clearance %.0f%% (%.1f µT)", AXIS[a], AXIS[b], w,
+                     clear * 100.0f, score);
+            if (clear >= 0.2f && score >= min_amp / 2.0f && score > best_score) {
               best = p;
-              best_quality = quality;
-              best_spread = spread;
+              best_score = score;
             }
           }
-          if (best < 0) {
-            fail("low signal, fewer than two axes above the minimal amplitude");
+          if (usable == 0) {
+            fail("low signal or no water flowing, fewer than two axes above the minimal amplitude");
             return;
           }
-          if (best_quality < min_amp / 2.0f) {
-            fail("axes swing in phase, rotate the sensor ~45° around the meter axis");
+          // Over a partial turn the min/max center means little, so a failed clearance is more
+          // likely an incomplete turn than in-phase axes when no pair went fully around.
+          float max_turns = 0;
+          for (int p = 0; p < 3; p++) max_turns = std::max(max_turns, fabsf(winding[p]));
+          if (best < 0 && max_turns >= 0.95f) {
+            fail("axes swing in phase, rotate the sensor ~45° on the meter");
             return;
           }
-          // A complete turn gives four consistent estimates of the phase; a partial one does not.
-          if (best_spread > 0.6f) {
-            fail("incomplete turn, run more water or raise the calibration time");
+          // Only the best pair decides: a poorer pair can show a bogus winding from noise.
+          const float turns = best < 0 ? max_turns : fabsf(winding[best]);
+          if (turns < 0.95f) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "incomplete turn (%.2f seen), run more water or raise the calibration time",
+                     turns);
+            fail(msg);
             return;
           }
 
-          // Keep the previous calibration until direction detection has validated this one.
-          id(magdial_prev_center) = id(magdial_center);
-          id(magdial_prev_amplitude) = id(magdial_amplitude);
-          id(magdial_prev_pair_cos) = id(magdial_pair_cos);
-          id(magdial_prev_pair) = id(magdial_axis_pair).active_index().value_or(3);
+          // Water flows forward during calibration, so the winding sign is the direction.
+          // Pairs that would not pass validation get 0 and are never counted, even if selected by hand.
+          std::array<float, 3> sign{};
+          for (int p = 0; p < 3; p++) {
+            const int a = AXES[p][0], b = AXES[p][1];
+            const bool valid = amp[a] >= min_amp && amp[b] >= min_amp && clearance[p] >= 0.2f &&
+                               clearance[p] * std::min(amp[a], amp[b]) >= min_amp / 2.0f &&
+                               fabsf(winding[p]) >= 0.95f;
+            if (valid) sign[p] = winding[p] < 0 ? -1.0f : 1.0f;
+          }
           id(magdial_center) = center;
           id(magdial_amplitude) = amp;
-          id(magdial_pair_cos) = pair_cos;
+          id(magdial_pair_sign) = sign;
+          id(magdial_clearance) = clearance[best];
+          id(magdial_cal_turns) = fabsf(winding[best]);
+
           const int a = AXES[best][0], b = AXES[best][1];
           char details[96];
-          snprintf(details, sizeof(details), "%c/%c, phase %.0f°, amplitude %.1f/%.1f µT", AXIS[a], AXIS[b],
-                   acosf(pair_cos[best]) * 180.0f / static_cast<float>(M_PI), amp[a], amp[b]);
-          id(magdial_calibration_details).publish_state(details);
-          ESP_LOGI("magdial", "Selected %s, detecting rotation direction", details);
-
-          id(magdial_axis_pair).make_call().set_index(best).perform();
+          snprintf(details, sizeof(details), "%c/%c, %.2f turns, clearance %.0f%% (%.0f µT)", AXIS[a], AXIS[b],
+                   fabsf(winding[best]), clearance[best] * 100.0f, best_score);
+          ESP_LOGI("magdial", "Calibration complete: %s", details);
+          id(magdial_axis_pair).make_call().set_index(best).perform();  // also re-syncs the angle
           id(magdial_have_last) = false;
-          id(magdial_direction_acc) = 0;
-          id(magdial_direction_radius_sum) = 0;
-          id(magdial_direction_samples) = 0;
-          id(magdial_signal_quality) = 1;
-          id(magdial_cal_phase) = 2;
-          id(magdial_calibration_status).publish_state("Detecting direction: keep water running");
+          id(magdial_calibration_status).publish_state("Ready");
+          id(magdial_calibration_details).publish_state(details);
 
 sensor:
   - platform: template
@@ -622,16 +656,17 @@ sensor:
     filters:
       - delta: 1
 
-  # ~100 % when calibration matches the signal; drifting away means recalibrate.
+  # Closest approach of the loop to its center over the last turn, in % of the amplitude.
+  # Falling toward 0 means the field changed (sensor moved, drift): recalibrate.
   - platform: template
-    name: Signal quality
+    name: Signal clearance
     entity_category: diagnostic
     icon: mdi:signal
     unit_of_measurement: '%'
     accuracy_decimals: 0
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
-    lambda: return id(magdial_signal_quality) * 100.0f;
+    lambda: return id(magdial_clearance) * 100.0f;
     filters:
       - delta: 1
 
