@@ -174,6 +174,46 @@ globals:
     type: double
     initial_value: '0'
 
+  # --- Learned angle mapping ---
+  # Raw angle (0..1, forward) where the dial has done 1/10, 2/10, ... 9/10 of a turn.
+  - id: magdial_curve
+    type: std::array<float, 9>
+    restore_value: true
+    initial_value: '{{0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f}}'
+  # Complete turns the curve was learned from (capped at 15); used once >= 3
+  - id: magdial_curve_turns
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # Mapping in use, only changed at a turn boundary where Raw and Learned agree
+  - id: magdial_curve_active
+    type: bool
+    initial_value: 'false'
+  - id: magdial_last_raw
+    type: float
+    initial_value: '0'
+  # Current turn: ms since its start when the raw angle first reached j/100
+  - id: magdial_learn_active
+    type: bool
+    initial_value: 'false'
+  - id: magdial_learn_start
+    type: uint32_t
+    initial_value: '0'
+  - id: magdial_learn_next
+    type: int
+    initial_value: '0'
+  - id: magdial_learn_marks
+    type: std::array<uint32_t, 100>
+  # Breakpoints of the last 15 complete turns; the curve is their median
+  - id: magdial_learn_history
+    type: std::array<std::array<float, 9>, 15>
+  - id: magdial_learn_head
+    type: int
+    initial_value: '0'
+  - id: magdial_learn_count
+    type: int
+    initial_value: '0'
+
 number:
   - platform: template
     id: magdial_volume_per_rotation
@@ -241,6 +281,20 @@ select:
           id(magdial_have_last) = false;  // angle mapping changed, re-sync
           if (id(magdial_cal_phase) == 0) id(magdial_publish_status).execute();
 
+  # Learned: corrected by a curve learned from complete turns, more precise within a turn
+  # (falls back to Raw until 3 turns are learned). Raw: angle of the field around its loop
+  # center, uneven within a turn when the magnet is close to the sensor. Takes effect at the
+  # next turn boundary.
+  - platform: template
+    id: magdial_angle_mapping
+    name: Angle mapping
+    entity_category: config
+    icon: mdi:chart-bell-curve-cumulative
+    options: [Learned, Raw]
+    initial_option: Learned
+    restore_value: true
+    optimistic: true
+
 switch:
   - platform: template
     id: magdial_adaptive
@@ -293,6 +347,14 @@ text_sensor:
     name: Calibration details
     entity_category: diagnostic
     icon: mdi:text-box-outline
+    update_interval: never
+
+  # Raw angle (degrees) at each tenth of a turn: evenly spaced (36 72 108 ...) = no correction
+  - platform: template
+    id: magdial_curve_text
+    name: Learned curve
+    entity_category: diagnostic
+    icon: mdi:chart-bell-curve-cumulative
     update_interval: never
 
 script:
@@ -387,29 +449,112 @@ script:
           auto &amp = id(magdial_amplitude);
           if (amp[a] <= 0 || amp[b] <= 0 || id(magdial_pair_sign)[p] == 0) return;  // pair not validated
 
-          // --- Dial angle: angle of the normalised field around the center of its loop ---
+          // --- Raw dial angle: angle of the normalised field around the center of its loop,
+          //     oriented to increase with forward flow, 0..1 turn ---
           const float na = (v[a] - center[a]) / amp[a];
           const float nb = (v[b] - center[b]) / amp[b];
           const float radius = sqrtf(na * na + nb * nb);
-          const float angle = atan2f(nb, na) / (2.0f * static_cast<float>(M_PI));  // -0.5..0.5 turn
+          float r = id(magdial_pair_sign)[p] * atan2f(nb, na) / (2.0f * static_cast<float>(M_PI));
+          r -= floorf(r);
+          const uint32_t now = millis();
+
+          // Learned mapping: section k (k/10..(k+1)/10 of a turn) spans raw angles curve[k-1]..curve[k]
+          auto map_angle = [&](float x) {
+            if (!id(magdial_curve_active)) return x;
+            const auto &bp = id(magdial_curve);
+            float lo = 0;
+            for (int k = 0; k < 10; k++) {
+              const float hi = k < 9 ? bp[k] : 1.0f;
+              if (x < hi || k == 9) return (k + std::min(1.0f, (x - lo) / std::max(1e-6f, hi - lo))) / 10.0f;
+              lo = hi;
+            }
+            return x;
+          };
 
           if (!id(magdial_have_last)) {
-            id(magdial_last_angle) = angle;
+            id(magdial_curve_active) =
+                id(magdial_angle_mapping).active_index().value_or(0) == 0 && id(magdial_curve_turns) >= 3;
+            id(magdial_last_raw) = r;
+            id(magdial_last_angle) = map_angle(r);
             id(magdial_have_last) = true;
+            id(magdial_learn_active) = false;
             id(magdial_turn_tracking) = false;
             id(magdial_turn_clearance) = radius;
             id(magdial_last_full_turn) = floor(id(magdial_rotations_total));
             return;
           }
+          const float last_r = id(magdial_last_raw);
+          id(magdial_last_raw) = r;
+          float dr = r - last_r;
+          if (dr > 0.5f) dr -= 1.0f;
+          else if (dr < -0.5f) dr += 1.0f;
+          if (fabsf(dr) > 0.3f) {
+            ESP_LOGW("magdial", "Dial moved %.0f° between two samples, turns may be missed: "
+                     "lower magnetometer_update_interval", fabsf(dr) * 360.0f);
+          }
+
+          // --- Learning: a complete turn goes from one forward crossing of raw angle 0 to the next.
+          //     The raw angle where the elapsed time reaches k/10 of the turn is breakpoint k. One
+          //     turn mixes flow changes in; they are not tied to the dial position, the curve is,
+          //     so the median over the last 15 turns keeps the curve and drops the flow changes. ---
+          auto &marks = id(magdial_learn_marks);
+          if (dr < 0 && r > last_r) id(magdial_learn_active) = false;  // went back across 0: drop the turn
+          if (dr > 0 && r < last_r) {
+            if (id(magdial_learn_active)) {
+              const uint32_t total = now - id(magdial_learn_start);
+              while (id(magdial_learn_next) < 100) marks[id(magdial_learn_next)++] = total;
+              std::array<float, 9> turn_bp;
+              int j = 0;
+              for (int k = 1; k < 10; k++) {
+                const float target = total * k / 10.0f;
+                while (j < 99 && marks[j + 1] <= target) j++;
+                const float t_lo = marks[j], t_hi = j < 99 ? marks[j + 1] : total;
+                const float f = t_hi > t_lo ? (target - t_lo) / (t_hi - t_lo) : 0.0f;
+                turn_bp[k - 1] = (j + std::max(0.0f, std::min(1.0f, f))) / 100.0f;
+              }
+              auto &hist = id(magdial_learn_history);
+              hist[id(magdial_learn_head)] = turn_bp;
+              id(magdial_learn_head) = (id(magdial_learn_head) + 1) % 15;
+              id(magdial_learn_count) = std::min(id(magdial_learn_count) + 1, 15);
+              id(magdial_curve_turns) = std::min(id(magdial_curve_turns) + 1, 15);
+              const int n = id(magdial_learn_count);
+              if (n >= 3) {
+                // Per breakpoint median; order statistics keep the breakpoints increasing
+                std::array<float, 9> curve;
+                float col[15];
+                for (int k = 0; k < 9; k++) {
+                  for (int i = 0; i < n; i++) col[i] = hist[i][k];
+                  std::nth_element(col, col + n / 2, col + n);
+                  curve[k] = col[n / 2];
+                }
+                id(magdial_curve) = curve;
+                char text[64];
+                int len = 0;
+                for (int k = 0; k < 9 && len < (int) sizeof(text); k++)
+                  len += snprintf(text + len, sizeof(text) - len, k ? " %.0f" : "%.0f", curve[k] * 360.0f);
+                id(magdial_curve_text).publish_state(text);
+              }
+            }
+            id(magdial_learn_active) = true;
+            id(magdial_learn_start) = now;
+            id(magdial_learn_next) = 0;
+            // Raw and Learned both map raw angle 0 to 0: switching here does not move the count
+            id(magdial_curve_active) =
+                id(magdial_angle_mapping).active_index().value_or(0) == 0 && id(magdial_curve_turns) >= 3;
+            id(magdial_last_angle) = map_angle(last_r);
+          }
+          if (id(magdial_learn_active)) {
+            while (id(magdial_learn_next) < 100 && r * 100.0f >= id(magdial_learn_next))
+              marks[id(magdial_learn_next)++] = now - id(magdial_learn_start);
+          }
+
+          // --- Count: movement of the (mapped) dial position ---
+          const float angle = map_angle(r);
           float d = angle - id(magdial_last_angle);
           if (d > 0.5f) d -= 1.0f;
           else if (d < -0.5f) d += 1.0f;
           id(magdial_last_angle) = angle;
-          if (fabsf(d) > 0.3f) {
-            ESP_LOGW("magdial", "Dial moved %.0f° between two samples, turns may be missed: "
-                     "lower magnetometer_update_interval", fabsf(d) * 360.0f);
-          }
-          id(magdial_rotations_total) += d * id(magdial_pair_sign)[p];
+          id(magdial_rotations_total) += d;
           id(magdial_turn_clearance) = std::min(id(magdial_turn_clearance), radius);
 
           // --- Adaptive calibration: after each complete forward turn, nudge toward observed extremes ---
@@ -560,6 +705,13 @@ script:
           id(magdial_pair_sign) = sign;
           id(magdial_clearance) = clearance[best];
           id(magdial_cal_turns) = fabsf(winding[best]);
+          // New geometry, new raw angle: learn the curve again
+          id(magdial_curve) = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f};
+          id(magdial_curve_turns) = 0;
+          id(magdial_learn_count) = 0;
+          id(magdial_learn_head) = 0;
+          id(magdial_learn_active) = false;
+          id(magdial_curve_text).publish_state("");
 
           const int a = AXES[best][0], b = AXES[best][1];
           char details[96];
@@ -653,6 +805,17 @@ sensor:
     lambda: |-
       const double r = id(magdial_rotations_total);
       return (r - floor(r)) * 360.0;
+    filters:
+      - delta: 1
+
+  - platform: template
+    name: Curve learned turns
+    entity_category: diagnostic
+    icon: mdi:school
+    accuracy_decimals: 0
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: return id(magdial_curve_turns);
     filters:
       - delta: 1
 

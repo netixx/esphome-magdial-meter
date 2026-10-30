@@ -1,0 +1,14 @@
+---
+# Learned angle mapping under random flow with random stops: once the curve is learned from
+# 10 turns, the position within a turn must be right to 0.1 turn (Raw is off by ~0.2 with
+# this magnet).
+packages:
+  sim: !include sim-host.yaml
+substitutions:
+  sim_name: magdial-sim-learned
+  sim_angle_mapping: Learned
+  sim_random_flow: 'true'
+  sim_duration_seconds: '300'
+  # Whole-turn checks start before learning: the curve legitimately moves positions within a turn
+  sim_max_error_turns: '0.45'
+  sim_max_within_turn_error: '0.1'

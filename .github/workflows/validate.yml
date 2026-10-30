@@ -53,3 +53,8 @@ jobs:
         run: |
           esphome compile tests/replay-real-log-short.yaml
           cd tests && ./.esphome/build/magdial-replay-short/.pioenvs/magdial-replay-short/program
+
+      - name: Simulation, learned angle mapping under random flow
+        run: |
+          esphome compile tests/sim-learned-curve.yaml
+          cd tests && ./.esphome/build/magdial-sim-learned/.pioenvs/magdial-sim-learned/program

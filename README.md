@@ -98,6 +98,7 @@ affects a freshly flashed device. Change them in Home Assistant instead.
 | Calibration time | config | Length of the calibration, in s (5 to 3600) |
 | Calibration minimal amplitude | config | Weakest usable axis swing, in µT |
 | Axis pair | config | Axes used for the angle, set by calibration (x/y, x/z, y/z) |
+| Angle mapping | config | **Learned** (default): position within a turn corrected by the learned curve. **Raw**: uncorrected angle |
 | Adaptive calibration | config | Follow slow drift of the field after each complete turn |
 | Calibrate / Finish calibration now / Cancel calibration | config | Buttons |
 | Calibration status | diagnostic | Not calibrated, Calibrating, Ready, Failed: reason |
@@ -106,6 +107,8 @@ affects a freshly flashed device. Change them in Home Assistant instead.
 | Magnetic field X / Y / Z min, max | diagnostic | Live extremes while calibrating, calibrated (and adapted) extremes otherwise |
 | Dial angle | diagnostic | Position within the current turn, 0 to 360° |
 | Rotations total | diagnostic | Turns counted since forever, fractional |
+| Learned curve | diagnostic | Raw angle (°) at each tenth of a turn. Evenly spaced (36 72 108 …) means no correction |
+| Curve learned turns | diagnostic | Complete turns the curve was learned from (0 to 15, used from 3) |
 | Signal clearance | diagnostic | Closest approach of the signal loop to its center over the last turn, in % of the amplitude |
 
 A dashboard card to watch the signal and calibrate (entity IDs for a device named `water-meter`):
@@ -171,9 +174,27 @@ real meter two axes often mirror each other (in a test log, Y and Z: clearance 1
 a flat loop through the center. That pair is useless even if both axes swing strongly, which is
 why the pair is chosen by clearance and not by amplitude.
 
-**Accuracy within a turn**: a magnet close to the sensor gives a non-uniform signal, so the angle
-advances faster on some parts of the turn than others. The count of turns is exact, but within a
-turn Total can lead or lag by up to ~0.2 turn (2 L on a 10 L dial). It never accumulates.
+### Angle mapping: Raw or Learned
+
+A magnet close to the sensor gives a non-uniform signal: the raw angle advances faster on some
+parts of the turn than others. The count of turns is exact either way, but with **Raw** Total can
+lead or lag within a turn by up to ~0.2 turn (2 L on a 10 L dial). It never accumulates.
+
+**Learned** (default) corrects that with a curve of 10 sections of equal volume (1 L each on a
+10 L dial), each spanning its own range of raw angle. The curve is learned from complete turns in
+normal use, no constant flow needed:
+
+- for each complete turn, the raw angles where 10 %, 20 %, ... of the turn's time had elapsed;
+- within one turn a flow change looks like a distortion of the curve, but flow changes happen at
+  random positions while the distortion is tied to the dial position. The median of each
+  breakpoint over the last 15 turns keeps the distortion and drops the flow changes.
+
+It is used once 3 turns are learned (Raw until then), keeps learning for good, and is reset by a
+new calibration. Switching between Raw and Learned takes effect at the next turn boundary, where
+both agree, so Total never jumps. In simulation, with random flow changes and stops, the largest
+error within a turn (measured from a turn boundary) is 0.05 turn with Learned against 0.42 with
+Raw: 0.5 L instead of 4 L on a 10 L dial. Learning runs in Raw mode too, so its entities show
+progress either way.
 
 | Status | Fix |
 | --- | --- |
@@ -218,7 +239,8 @@ Changing **Volume per rotation** keeps Total as it is: the new value applies to 
   (`tests/data/real_log_qmc5883p.h`) replayed through the package: calibration must pick x/y
   and count the 1.75 turns of the log, and a calibration over less than a turn must fail;
 - `sim-*.yaml`: a simulated magnet orbiting close to the sensor, with noise and thermal drift:
-  full run, calibration over a partial turn, long calibration at high flow.
+  full run, calibration over a partial turn, long calibration at high flow, and the learned
+  angle mapping under random flow with stops.
 
 Each replay and simulation compiles for the host and exits non-zero on failure:
 
@@ -226,7 +248,8 @@ Each replay and simulation compiles for the host and exits non-zero on failure:
 pip install esphome
 esphome config tests/test-*.yaml
 for t in replay-real-log:magdial-replay replay-real-log-short:magdial-replay-short \
-         sim-host:magdial-sim sim-partial-turn:magdial-sim-partial sim-long-calibration:magdial-sim-long; do
+         sim-host:magdial-sim sim-partial-turn:magdial-sim-partial sim-long-calibration:magdial-sim-long \
+         sim-learned-curve:magdial-sim-learned; do
   esphome compile tests/${t%%:*}.yaml && (cd tests && .esphome/build/${t##*:}/.pioenvs/${t##*:}/program) || break
 done
 ```

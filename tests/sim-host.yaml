@@ -15,6 +15,11 @@ substitutions:
   sim_expect_failure: ''
   # Flow in turns per second while calibrating (and until t=60 s)
   sim_calibration_rate: '0.2'
+  sim_angle_mapping: Raw
+  # true: after t=60 s, flow drifts randomly between 0.05 and 0.6 turn/s and stops at random
+  sim_random_flow: 'false'
+  # Once the curve is learned from 10 turns: max error anywhere within a turn ('1' disables)
+  sim_max_within_turn_error: '1'
   # Checked each time the simulated dial is back where counting started: there the
   # within-turn non-linearity cancels, so the count must match the simulated turns.
   sim_max_error_turns: '0.1'
@@ -31,6 +36,9 @@ esphome:
       - select.set:
           id: magdial_axis_pair
           option: None
+      - select.set:
+          id: magdial_angle_mapping
+          option: ${sim_angle_mapping}
 
 host:
 
@@ -80,6 +88,16 @@ globals:
   - id: sim_turns_after_cal
     type: double
     initial_value: 'NAN'
+  # Reference taken at the turn boundary where the curve reached 10 learned turns
+  - id: sim_turns_at_learned
+    type: double
+    initial_value: 'NAN'
+  - id: sim_rot_at_learned
+    type: double
+    initial_value: '0'
+  - id: sim_max_within_error
+    type: double
+    initial_value: '0'
 
 sensor:
   - platform: template
@@ -106,6 +124,13 @@ interval:
           if (t > 1 && t < 60) rate = -${sim_calibration_rate};  // calibration (from t=3 s), then counting
           else if (t > 70 && t < 100) rate = -0.5f;  // fast flow
           else if (t > 110 && t < 160) rate = -0.03f;  // slow flow
+          if (${sim_random_flow} && t > 60) {
+            static float q = 0.3f;
+            if (random_float() < 0.002f) q = 0;                                  // stop
+            else if (q == 0 && random_float() < 0.02f) q = 0.05f + 0.5f * random_float();  // restart
+            else if (q > 0) q = std::min(0.6f, std::max(0.05f, q * (1.0f + 0.1f * (random_float() - 0.5f))));
+            rate = -q;
+          }
           id(sim_turns) += rate * 0.05;
           // Dipole magnet orbiting 6 mm off the dial axis, 14 mm from the sensor: sharp,
           // far from sinusoidal peaks, and the x/z pair swings in phase (like real meters).
@@ -140,6 +165,17 @@ interval:
             id(sim_turns_at_ready) = id(sim_turns);
             id(sim_rot_at_ready) = id(magdial_rotations_total);
           }
+          // Within-turn accuracy, from the turn boundary where the curve reached 10 learned turns
+          if (std::isnan(id(sim_turns_at_learned)) && id(magdial_curve_turns) >= 10) {
+            id(sim_turns_at_learned) = id(sim_turns);
+            id(sim_rot_at_learned) = id(magdial_rotations_total);
+          }
+          if (!std::isnan(id(sim_turns_at_learned))) {
+            const double err = (id(magdial_rotations_total) - id(sim_rot_at_learned)) +
+                               (id(sim_turns) - id(sim_turns_at_learned));
+            id(sim_max_within_error) = std::max(id(sim_max_within_error), fabs(err));
+          }
+
           static double last_sim = 0;
           const double sim = -(id(sim_turns) - id(sim_turns_at_ready));
           if (floor(sim) != floor(last_sim)) {  // dial back at the starting position
@@ -172,6 +208,12 @@ interval:
             ESP_LOGI("sim", "Calibration saw %.2f turns, simulated %.2f", id(magdial_cal_turns), cal_turns);
             ok = id(sim_checks) >= 5 && id(sim_max_error) < ${sim_max_error_turns} &&
                  fabs(id(magdial_cal_turns) - cal_turns) < 0.6;
+            if (${sim_max_within_turn_error} < 1) {
+              ESP_LOGI("sim", "Curve learned from %d turns, max error within a turn %.3f", id(magdial_curve_turns),
+                       id(sim_max_within_error));
+              ok = ok && !std::isnan(id(sim_turns_at_learned)) &&
+                   id(sim_max_within_error) < ${sim_max_within_turn_error};
+            }
           } else {
             ok = id(magdial_cal_samples) > 0 && status.rfind("Failed", 0) == 0 &&
                  status.find("${sim_expect_failure}") != std::string::npos;
