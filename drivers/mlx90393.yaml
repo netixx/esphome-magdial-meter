@@ -1,0 +1,40 @@
+---
+# MLX90393, native ESPHome driver. https://esphome.io/components/sensor/mlx90393/
+# Factory address is 0x0C. Adafruit STEMMA QT breakouts sold since May 2023 use 0x18:
+# override with  sensor: [{id: !extend magnetometer, address: 0x18}]
+logger:
+  logs:
+    mlx90393: INFO
+
+sensor:
+  - platform: mlx90393
+    id: magnetometer
+    i2c_id: magdial_i2c
+    update_interval: ${magnetometer_update_interval}
+    address: 0x0C
+    oversampling: 1
+    filter: 5
+    x_axis:
+      id: magnetic_field_x
+      name: Magnetic field X
+      entity_category: diagnostic
+      internal: ${hide_debug_sensors}
+      filters:
+        - throttle_average: ${debug_update_interval}
+    y_axis:
+      id: magnetic_field_y
+      name: Magnetic field Y
+      entity_category: diagnostic
+      internal: ${hide_debug_sensors}
+      filters:
+        - throttle_average: ${debug_update_interval}
+    z_axis:
+      id: magnetic_field_z
+      name: Magnetic field Z
+      entity_category: diagnostic
+      internal: ${hide_debug_sensors}
+      filters:
+        - throttle_average: ${debug_update_interval}
+      # Drivers publish X, Y, then Z: by now all three axes hold this sample.
+      on_raw_value:
+        - script.execute: magdial_process

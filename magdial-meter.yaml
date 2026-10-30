@@ -1,0 +1,721 @@
+---
+# Read a meter dial (e.g. a water meter whose magnet turns once per 10 L) by
+# tracking the angle of its rotating magnet with a 3-axis magnetometer.
+#
+# Not standalone: combine with exactly one file from drivers/ that defines the
+# magnetometer sensor. See README.md.
+#
+# How it works:
+#   A rotating magnet makes each axis of the field a sinusoid of the dial angle,
+#   each with its own offset, amplitude and phase. Calibration records, over at
+#   least one full turn, the min/max of every axis (giving offset and amplitude)
+#   and the value of the other axes at each extreme (giving the phase between
+#   axes). It then picks the axis pair with the strongest usable signal, and the
+#   dial angle is reconstructed continuously from that pair. Unlike counting
+#   threshold crossings, this resolves fractions of a turn.
+
+substitutions:
+  # For water one of: CCF, ft³, gal, L, m³
+  volume_unit: 'L'
+  device_class: 'water'
+  device_icon: 'mdi:water'
+  total_accuracy_decimals: '2'
+  flow_accuracy_decimals: '2'
+
+  i2c_scl: GPIO5
+  i2c_sda: GPIO4
+  i2c_frequency: 50kHz
+  i2c_scan: 'false'
+
+  # Sample at least ~10x per turn at the highest flow you expect. The dial must
+  # move less than half a turn between two samples or turns are miscounted.
+  magnetometer_update_interval: 50ms
+
+  # Initial values of entities editable in Home Assistant (restored on reboot,
+  # so changing these only affects a freshly flashed device).
+  # Volume of one full turn of the magnet, in volume_unit.
+  volume_per_rotation_initial_value: '10'
+  # Calibration must cover at least one full turn: at 6 L/min a 10 L dial needs 100 s.
+  calibration_seconds_initial_value: '180'
+  # Minimum half-amplitude (µT) an axis must swing to be usable.
+  calibration_min_amplitude_initial_value: '3'
+
+  # Publish rate of the debug entities (raw field per axis, dial angle, ...).
+  # The algorithm always uses every sample; this only limits Home Assistant traffic.
+  debug_update_interval: 2s
+  hide_debug_sensors: 'false'
+
+  # Flow is computed from the movement of the dial over this interval.
+  flow_update_interval: 10s
+  # Dial movement (in turns) below which Flow reads 0, to ignore sensor noise.
+  # Smaller movements keep accumulating for up to 10 min, so slow leaks still show.
+  flow_deadband_rotations: '0.01'
+
+  # Each complete turn pulls the calibration this fraction toward what was just
+  # observed, to follow temperature drift (only when "Adaptive calibration" is on).
+  adapt_rate: '0.1'
+
+esphome:
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          auto pair = id(magdial_axis_pair).active_index();
+          id(magdial_calibration_status).publish_state(
+              pair.has_value() && *pair < 3 ? "Ready" : "Not calibrated");
+
+logger:
+  logs:
+    sensor: INFO
+    script: INFO
+
+i2c:
+  - id: magdial_i2c
+    scl: ${i2c_scl}
+    sda: ${i2c_sda}
+    frequency: ${i2c_frequency}
+    scan: ${i2c_scan}
+
+api:
+  actions:
+    # Make Total match the reading on the physical meter.
+    - action: set_total
+      variables:
+        new_total: float
+      then:
+        - lambda: |-
+            id(magdial_volume_offset) =
+                new_total - id(magdial_rotations_total) * id(magdial_volume_per_rotation).state;
+            id(magdial_total_published) = new_total;
+            id(magdial_total).publish_state(new_total);
+
+globals:
+  # --- Persistent counting state ---
+  # Signed number of dial turns since forever (fractional).
+  - id: magdial_rotations_total
+    type: double
+    restore_value: true
+    initial_value: '0'
+  - id: magdial_volume_offset
+    type: double
+    restore_value: true
+    initial_value: '0'
+  # Highest Total ever published: Total is total_increasing and must never go down.
+  - id: magdial_total_published
+    type: double
+    restore_value: true
+    initial_value: '0'
+
+  # --- Persistent calibration, per axis x, y, z ---
+  - id: magdial_center
+    type: std::array<float, 3>
+    restore_value: true
+  - id: magdial_amplitude
+    type: std::array<float, 3>
+    restore_value: true
+  # Cosine of the phase between the axes of each pair x/y, x/z, y/z.
+  - id: magdial_pair_cos
+    type: std::array<float, 3>
+    restore_value: true
+
+  # --- Calibration runtime state ---
+  # 0 idle, 1 recording extremes, 2 detecting rotation direction
+  - id: magdial_cal_phase
+    type: int
+    initial_value: '0'
+  - id: magdial_cal_finish
+    type: bool
+    initial_value: 'false'
+  - id: magdial_cal_samples
+    type: uint32_t
+    initial_value: '0'
+  - id: magdial_cal_lo
+    type: std::array<float, 3>
+  - id: magdial_cal_hi
+    type: std::array<float, 3>
+  # [i * 3 + j]: value of axis j at the moment axis i reached its min (lo) / max (hi)
+  - id: magdial_cal_at_lo
+    type: std::array<float, 9>
+  - id: magdial_cal_at_hi
+    type: std::array<float, 9>
+  - id: magdial_direction_acc
+    type: float
+    initial_value: '0'
+  # Mean radius of the reconstructed angle vector while detecting direction
+  - id: magdial_direction_radius_sum
+    type: float
+    initial_value: '0'
+  - id: magdial_direction_samples
+    type: uint32_t
+    initial_value: '0'
+  # Previous calibration, restored if the new one fails validation
+  - id: magdial_prev_center
+    type: std::array<float, 3>
+  - id: magdial_prev_amplitude
+    type: std::array<float, 3>
+  - id: magdial_prev_pair_cos
+    type: std::array<float, 3>
+  - id: magdial_prev_pair
+    type: size_t
+    initial_value: '3'
+
+  # --- Tracking runtime state ---
+  - id: magdial_have_last
+    type: bool
+    initial_value: 'false'
+  # Last raw dial angle in turns, -0.5..0.5
+  - id: magdial_last_angle
+    type: float
+    initial_value: '0'
+  # Smoothed radius of the reconstructed angle vector, 1.0 = perfect calibration
+  - id: magdial_signal_quality
+    type: float
+    initial_value: '1'
+  # Per-turn extremes for adaptive calibration
+  - id: magdial_turn_lo
+    type: std::array<float, 3>
+  - id: magdial_turn_hi
+    type: std::array<float, 3>
+  - id: magdial_turn_tracking
+    type: bool
+    initial_value: 'false'
+  - id: magdial_last_full_turn
+    type: double
+    initial_value: '0'
+
+number:
+  - platform: template
+    id: magdial_volume_per_rotation
+    name: Volume per rotation
+    entity_category: config
+    icon: mdi:rotate-360
+    mode: box
+    min_value: 0.0001
+    max_value: 100000
+    step: 0.0001
+    initial_value: ${volume_per_rotation_initial_value}
+    unit_of_measurement: ${volume_unit}
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    id: magdial_calibration_time
+    name: Calibration time
+    entity_category: config
+    icon: mdi:timer
+    mode: box
+    min_value: 5
+    max_value: 3600
+    step: 1
+    initial_value: ${calibration_seconds_initial_value}
+    unit_of_measurement: s
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    id: magdial_calibration_min_amplitude
+    name: Calibration minimal amplitude
+    entity_category: config
+    icon: mdi:sine-wave
+    mode: box
+    min_value: 0.1
+    max_value: 1000
+    step: 0.1
+    initial_value: ${calibration_min_amplitude_initial_value}
+    unit_of_measurement: µT
+    restore_value: true
+    optimistic: true
+
+select:
+  # Set by calibration; can be overridden by hand without recalibrating.
+  - platform: template
+    id: magdial_axis_pair
+    name: Axis pair
+    entity_category: config
+    icon: mdi:axis-arrow
+    options: [x/y, x/z, y/z, None]
+    initial_option: None
+    restore_value: true
+    optimistic: true
+    on_value:
+      - lambda: |-
+          id(magdial_have_last) = false;  // angle mapping changed, re-sync
+          if (id(magdial_cal_phase) == 0) {
+            id(magdial_calibration_status).publish_state(i < 3 ? "Ready" : "Not calibrated");
+          }
+
+  # Set by calibration; flip it if Total does not increase while water runs.
+  - platform: template
+    id: magdial_direction
+    name: Rotation direction
+    entity_category: config
+    icon: mdi:rotate-right
+    options: [Normal, Reversed]
+    initial_option: Normal
+    restore_value: true
+    optimistic: true
+
+switch:
+  - platform: template
+    id: magdial_adaptive
+    name: Adaptive calibration
+    entity_category: config
+    icon: mdi:auto-fix
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+
+button:
+  - platform: template
+    name: Calibrate
+    entity_category: config
+    icon: mdi:tune
+    on_press:
+      - script.execute: magdial_calibrate
+
+  - platform: template
+    name: Finish calibration now
+    entity_category: config
+    icon: mdi:check
+    on_press:
+      - lambda: id(magdial_cal_finish) = true;
+
+  - platform: template
+    name: Cancel calibration
+    entity_category: config
+    icon: mdi:close
+    on_press:
+      - script.stop: magdial_calibrate
+      - lambda: |-
+          if (id(magdial_cal_phase) == 2) {  // new calibration not validated yet: roll back
+            id(magdial_center) = id(magdial_prev_center);
+            id(magdial_amplitude) = id(magdial_prev_amplitude);
+            id(magdial_pair_cos) = id(magdial_prev_pair_cos);
+            id(magdial_cal_phase) = 0;
+            id(magdial_axis_pair).make_call().set_index(id(magdial_prev_pair)).perform();
+          }
+          id(magdial_cal_phase) = 0;
+          id(magdial_have_last) = false;
+          auto pair = id(magdial_axis_pair).active_index();
+          id(magdial_calibration_status).publish_state(
+              pair.has_value() && *pair < 3 ? "Ready" : "Not calibrated");
+
+text_sensor:
+  - platform: template
+    id: magdial_calibration_status
+    name: Calibration status
+    entity_category: diagnostic
+    icon: mdi:information-outline
+    update_interval: never
+
+  - platform: template
+    id: magdial_calibration_details
+    name: Calibration details
+    entity_category: diagnostic
+    icon: mdi:text-box-outline
+    update_interval: never
+
+script:
+  # Called by the driver for every magnetometer sample, after X, Y and Z are published.
+  - id: magdial_process
+    mode: single
+    then:
+      - lambda: |-
+          const float v[3] = {id(magnetic_field_x).get_raw_state(), id(magnetic_field_y).get_raw_state(),
+                              id(magnetic_field_z).get_raw_state()};
+          if (std::isnan(v[0]) || std::isnan(v[1]) || std::isnan(v[2])) return;
+
+          // --- Calibration: record the extremes of each axis, and where the other axes were then ---
+          if (id(magdial_cal_phase) == 1) {
+            auto &lo = id(magdial_cal_lo);
+            auto &hi = id(magdial_cal_hi);
+            for (int i = 0; i < 3; i++) {
+              if (v[i] > hi[i]) {
+                hi[i] = v[i];
+                for (int j = 0; j < 3; j++) id(magdial_cal_at_hi)[i * 3 + j] = v[j];
+              }
+              if (v[i] < lo[i]) {
+                lo[i] = v[i];
+                for (int j = 0; j < 3; j++) id(magdial_cal_at_lo)[i * 3 + j] = v[j];
+              }
+            }
+            id(magdial_cal_samples)++;
+            return;
+          }
+
+          auto pair = id(magdial_axis_pair).active_index();
+          if (!pair.has_value() || *pair > 2) return;  // not calibrated
+          static const int AXES[3][2] = {{0, 1}, {0, 2}, {1, 2}};
+          const int p = *pair, a = AXES[p][0], b = AXES[p][1];
+          auto &center = id(magdial_center);
+          auto &amp = id(magdial_amplitude);
+          if (amp[a] <= 0 || amp[b] <= 0) return;
+
+          // --- Dial angle: na = cos(t), nb = cos(t - delta)  =>  sin(t) = (nb - na cos(delta)) / sin(delta) ---
+          const float na = (v[a] - center[a]) / amp[a];
+          const float nb = (v[b] - center[b]) / amp[b];
+          const float cd = id(magdial_pair_cos)[p];
+          const float sd = sqrtf(std::max(1e-4f, 1.0f - cd * cd));
+          const float s = (nb - na * cd) / sd;
+          const float angle = atan2f(s, na) / (2.0f * static_cast<float>(M_PI));  // -0.5..0.5 turn
+          id(magdial_signal_quality) = 0.98f * id(magdial_signal_quality) + 0.02f * sqrtf(na * na + s * s);
+
+          if (!id(magdial_have_last)) {
+            id(magdial_last_angle) = angle;
+            id(magdial_have_last) = true;
+            id(magdial_turn_tracking) = false;
+            id(magdial_last_full_turn) = floor(id(magdial_rotations_total));
+            return;
+          }
+          float d = angle - id(magdial_last_angle);
+          if (d > 0.5f) d -= 1.0f;
+          else if (d < -0.5f) d += 1.0f;
+          id(magdial_last_angle) = angle;
+          if (fabsf(d) > 0.3f) {
+            ESP_LOGW("magdial", "Dial moved %.0f° between two samples, turns may be missed: "
+                     "lower magnetometer_update_interval", fabsf(d) * 360.0f);
+          }
+
+          // --- Direction detection after calibration: water flows forward, so the sign of motion tells ---
+          if (id(magdial_cal_phase) == 2) {
+            id(magdial_direction_acc) += d;
+            id(magdial_direction_radius_sum) += sqrtf(na * na + s * s);
+            id(magdial_direction_samples)++;
+            const float acc = id(magdial_direction_acc);
+            if (fabsf(acc) >= 0.25f) {
+              // Outside the arc seen during calibration, a calibration from a partial turn
+              // reconstructs a vector far from the unit circle: reject it.
+              const float radius = id(magdial_direction_radius_sum) / id(magdial_direction_samples);
+              if (radius < 0.75f || radius > 1.25f) {
+                ESP_LOGE("magdial", "Calibration failed: signal radius %.2f instead of 1, the calibration did not "
+                         "cover a full turn. Previous calibration restored", radius);
+                id(magdial_center) = id(magdial_prev_center);
+                id(magdial_amplitude) = id(magdial_prev_amplitude);
+                id(magdial_pair_cos) = id(magdial_prev_pair_cos);
+                id(magdial_cal_phase) = 0;
+                id(magdial_axis_pair).make_call().set_index(id(magdial_prev_pair)).perform();
+                id(magdial_calibration_status).publish_state("Failed: incomplete turn, run more water or raise the calibration time");
+                return;
+              }
+              id(magdial_direction).make_call().set_index(acc < 0 ? 1 : 0).perform();
+              id(magdial_rotations_total) += fabsf(acc);  // count the water used to detect it
+              id(magdial_cal_phase) = 0;
+              id(magdial_turn_tracking) = false;
+              id(magdial_last_full_turn) = floor(id(magdial_rotations_total));
+              id(magdial_calibration_status).publish_state("Ready");
+              ESP_LOGI("magdial", "Calibration complete, rotation direction: %s", acc < 0 ? "Reversed" : "Normal");
+            }
+            return;
+          }
+
+          if (id(magdial_direction).active_index().value_or(0) == 1) d = -d;
+          id(magdial_rotations_total) += d;
+
+          // --- Adaptive calibration: after each complete forward turn, nudge toward observed extremes ---
+          auto &tlo = id(magdial_turn_lo);
+          auto &thi = id(magdial_turn_hi);
+          for (int i : {a, b}) {
+            tlo[i] = std::min(tlo[i], v[i]);
+            thi[i] = std::max(thi[i], v[i]);
+          }
+          const double turn = floor(id(magdial_rotations_total));
+          if (turn > id(magdial_last_full_turn)) {
+            // The first crossing after (re)start ends a partial turn: only start tracking there.
+            if (id(magdial_turn_tracking) && id(magdial_adaptive).state) {
+              bool plausible = true;
+              for (int i : {a, b}) {
+                const float obs = (thi[i] - tlo[i]) / 2.0f;
+                if (obs < 0.7f * amp[i] || obs > 1.3f * amp[i]) plausible = false;
+              }
+              if (plausible) {
+                for (int i : {a, b}) {
+                  center[i] += ${adapt_rate} * ((thi[i] + tlo[i]) / 2.0f - center[i]);
+                  amp[i] += ${adapt_rate} * ((thi[i] - tlo[i]) / 2.0f - amp[i]);
+                }
+              } else {
+                ESP_LOGD("magdial", "Turn extremes too far from calibration, not adapting");
+              }
+            }
+            id(magdial_turn_tracking) = true;
+            id(magdial_last_full_turn) = turn;
+            for (int i = 0; i < 3; i++) tlo[i] = thi[i] = v[i];
+          }
+
+  - id: magdial_calibrate
+    mode: restart
+    then:
+      - lambda: |-
+          ESP_LOGI("magdial", "Calibration started: run water for at least one full turn of the dial");
+          id(magdial_cal_lo).fill(std::numeric_limits<float>::max());
+          id(magdial_cal_hi).fill(std::numeric_limits<float>::lowest());
+          id(magdial_cal_samples) = 0;
+          id(magdial_cal_finish) = false;
+          id(magdial_cal_phase) = 1;
+          id(magdial_calibration_status).publish_state("Calibrating: run water for at least one full turn");
+      - wait_until:
+          condition:
+            lambda: return id(magdial_cal_finish);
+          timeout: !lambda return id(magdial_calibration_time).state * 1000;
+      - lambda: |-
+          id(magdial_cal_phase) = 0;
+          auto fail = [](const char *msg) {
+            ESP_LOGE("magdial", "Calibration failed: %s", msg);
+            id(magdial_calibration_status).publish_state(std::string("Failed: ") + msg);
+            id(magdial_have_last) = false;
+          };
+          if (id(magdial_cal_samples) < 10) {
+            fail("no magnetometer data");
+            return;
+          }
+
+          const auto &lo = id(magdial_cal_lo);
+          const auto &hi = id(magdial_cal_hi);
+          const auto &at_lo = id(magdial_cal_at_lo);
+          const auto &at_hi = id(magdial_cal_at_hi);
+          const char *AXIS = "xyz";
+          static const int AXES[3][2] = {{0, 1}, {0, 2}, {1, 2}};
+          std::array<float, 3> center, amp, pair_cos{};
+          for (int i = 0; i < 3; i++) {
+            center[i] = (hi[i] + lo[i]) / 2.0f;
+            amp[i] = (hi[i] - lo[i]) / 2.0f;
+            ESP_LOGI("magdial", "%c: min %.2f max %.2f amplitude %.2f µT", AXIS[i], lo[i], hi[i], amp[i]);
+          }
+
+          // Pick the pair with the largest usable amplitude: the weaker axis times sin(phase).
+          // Two axes in phase carry the same information and cannot give a direction.
+          const float min_amp = id(magdial_calibration_min_amplitude).state;
+          int best = -1;
+          float best_quality = 0, best_spread = 0;
+          for (int p = 0; p < 3; p++) {
+            const int a = AXES[p][0], b = AXES[p][1];
+            if (amp[a] < min_amp || amp[b] < min_amp) continue;
+            auto n = [&](int axis, float value) { return (value - center[axis]) / amp[axis]; };
+            // Four estimates of cos(phase): b at a's max and min, a at b's max and min.
+            const float e[4] = {n(b, at_hi[a * 3 + b]), -n(b, at_lo[a * 3 + b]),
+                                n(a, at_hi[b * 3 + a]), -n(a, at_lo[b * 3 + a])};
+            const float cd = std::max(-1.0f, std::min(1.0f, (e[0] + e[1] + e[2] + e[3]) / 4.0f));
+            const float spread = *std::max_element(e, e + 4) - *std::min_element(e, e + 4);
+            const float quality = std::min(amp[a], amp[b]) * sqrtf(1.0f - cd * cd);
+            pair_cos[p] = cd;
+            ESP_LOGI("magdial", "%c/%c: phase %.0f°, usable amplitude %.2f µT, consistency spread %.2f",
+                     AXIS[a], AXIS[b], acosf(cd) * 180.0f / static_cast<float>(M_PI), quality, spread);
+            if (quality > best_quality) {
+              best = p;
+              best_quality = quality;
+              best_spread = spread;
+            }
+          }
+          if (best < 0) {
+            fail("low signal, fewer than two axes above the minimal amplitude");
+            return;
+          }
+          if (best_quality < min_amp / 2.0f) {
+            fail("axes swing in phase, rotate the sensor ~45° around the meter axis");
+            return;
+          }
+          // A complete turn gives four consistent estimates of the phase; a partial one does not.
+          if (best_spread > 0.6f) {
+            fail("incomplete turn, run more water or raise the calibration time");
+            return;
+          }
+
+          // Keep the previous calibration until direction detection has validated this one.
+          id(magdial_prev_center) = id(magdial_center);
+          id(magdial_prev_amplitude) = id(magdial_amplitude);
+          id(magdial_prev_pair_cos) = id(magdial_pair_cos);
+          id(magdial_prev_pair) = id(magdial_axis_pair).active_index().value_or(3);
+          id(magdial_center) = center;
+          id(magdial_amplitude) = amp;
+          id(magdial_pair_cos) = pair_cos;
+          const int a = AXES[best][0], b = AXES[best][1];
+          char details[96];
+          snprintf(details, sizeof(details), "%c/%c, phase %.0f°, amplitude %.1f/%.1f µT", AXIS[a], AXIS[b],
+                   acosf(pair_cos[best]) * 180.0f / static_cast<float>(M_PI), amp[a], amp[b]);
+          id(magdial_calibration_details).publish_state(details);
+          ESP_LOGI("magdial", "Selected %s, detecting rotation direction", details);
+
+          id(magdial_axis_pair).make_call().set_index(best).perform();
+          id(magdial_have_last) = false;
+          id(magdial_direction_acc) = 0;
+          id(magdial_direction_radius_sum) = 0;
+          id(magdial_direction_samples) = 0;
+          id(magdial_signal_quality) = 1;
+          id(magdial_cal_phase) = 2;
+          id(magdial_calibration_status).publish_state("Detecting direction: keep water running");
+
+sensor:
+  - platform: template
+    id: magdial_total
+    name: Total
+    device_class: ${device_class}
+    icon: ${device_icon}
+    state_class: total_increasing
+    unit_of_measurement: ${volume_unit}
+    accuracy_decimals: ${total_accuracy_decimals}
+    update_interval: 10s
+    lambda: |-
+      // Ratchet: sensor noise and back-flow must never make a total_increasing sensor go down.
+      const double total =
+          id(magdial_rotations_total) * id(magdial_volume_per_rotation).state + id(magdial_volume_offset);
+      if (total > id(magdial_total_published)) id(magdial_total_published) = total;
+      return id(magdial_total_published);
+    filters:
+      - or:
+          - throttle: 60s
+          - delta: 0
+
+  - platform: template
+    id: magdial_flow
+    name: Flow
+    device_class: volume_flow_rate
+    icon: mdi:speedometer
+    state_class: measurement
+    unit_of_measurement: ${volume_unit}/min
+    accuracy_decimals: ${flow_accuracy_decimals}
+    update_interval: ${flow_update_interval}
+    lambda: |-
+      static double last_rot = NAN;
+      static uint32_t last_ms = 0;
+      const uint32_t now = millis();
+      const double rot = id(magdial_rotations_total);
+      if (std::isnan(last_rot) || id(magdial_cal_phase) != 0) {
+        last_rot = rot;
+        last_ms = now;
+        return 0.0f;
+      }
+      const double moved = rot - last_rot;
+      const uint32_t dt = now - last_ms;
+      if (moved < ${flow_deadband_rotations}) {
+        // Too small to tell from noise. Keep the baseline so a slow leak accumulates
+        // until it is measurable, but restart after back-flow or 10 min of nothing.
+        if (moved < 0 || dt > 600000) {
+          last_rot = rot;
+          last_ms = now;
+        }
+        return 0.0f;
+      }
+      last_rot = rot;
+      last_ms = now;
+      return moved * id(magdial_volume_per_rotation).state * 60000.0 / dt;
+    filters:
+      - or:
+          - throttle: 60s
+          - delta: 0
+
+  # --- Debug / diagnostic ---
+  - platform: template
+    name: Rotations total
+    entity_category: diagnostic
+    icon: mdi:counter
+    accuracy_decimals: 3
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: return id(magdial_rotations_total);
+    filters:
+      - delta: 0.001
+
+  - platform: template
+    name: Dial angle
+    entity_category: diagnostic
+    icon: mdi:angle-acute
+    unit_of_measurement: °
+    accuracy_decimals: 0
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      const double r = id(magdial_rotations_total);
+      return (r - floor(r)) * 360.0;
+    filters:
+      - delta: 1
+
+  # ~100 % when calibration matches the signal; drifting away means recalibrate.
+  - platform: template
+    name: Signal quality
+    entity_category: diagnostic
+    icon: mdi:signal
+    unit_of_measurement: '%'
+    accuracy_decimals: 0
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: return id(magdial_signal_quality) * 100.0f;
+    filters:
+      - delta: 1
+
+  # Extremes per axis: live while calibrating, calibrated (and adapted) values otherwise.
+  - platform: template
+    name: Magnetic field X min
+    entity_category: diagnostic
+    icon: mdi:arrow-collapse-down
+    unit_of_measurement: µT
+    accuracy_decimals: 1
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_lo)[0] : NAN;
+      return id(magdial_center)[0] - id(magdial_amplitude)[0];
+    filters:
+      - delta: 0.1
+  - platform: template
+    name: Magnetic field X max
+    entity_category: diagnostic
+    icon: mdi:arrow-collapse-up
+    unit_of_measurement: µT
+    accuracy_decimals: 1
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_hi)[0] : NAN;
+      return id(magdial_center)[0] + id(magdial_amplitude)[0];
+    filters:
+      - delta: 0.1
+  - platform: template
+    name: Magnetic field Y min
+    entity_category: diagnostic
+    icon: mdi:arrow-collapse-down
+    unit_of_measurement: µT
+    accuracy_decimals: 1
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_lo)[1] : NAN;
+      return id(magdial_center)[1] - id(magdial_amplitude)[1];
+    filters:
+      - delta: 0.1
+  - platform: template
+    name: Magnetic field Y max
+    entity_category: diagnostic
+    icon: mdi:arrow-collapse-up
+    unit_of_measurement: µT
+    accuracy_decimals: 1
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_hi)[1] : NAN;
+      return id(magdial_center)[1] + id(magdial_amplitude)[1];
+    filters:
+      - delta: 0.1
+  - platform: template
+    name: Magnetic field Z min
+    entity_category: diagnostic
+    icon: mdi:arrow-collapse-down
+    unit_of_measurement: µT
+    accuracy_decimals: 1
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_lo)[2] : NAN;
+      return id(magdial_center)[2] - id(magdial_amplitude)[2];
+    filters:
+      - delta: 0.1
+  - platform: template
+    name: Magnetic field Z max
+    entity_category: diagnostic
+    icon: mdi:arrow-collapse-up
+    unit_of_measurement: µT
+    accuracy_decimals: 1
+    update_interval: ${debug_update_interval}
+    internal: ${hide_debug_sensors}
+    lambda: |-
+      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_hi)[2] : NAN;
+      return id(magdial_center)[2] + id(magdial_amplitude)[2];
+    filters:
+      - delta: 0.1

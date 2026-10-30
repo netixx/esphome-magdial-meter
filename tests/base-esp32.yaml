@@ -1,0 +1,15 @@
+---
+# Minimal device scaffolding for config-validation tests. Not for flashing.
+esphome:
+  name: test-magdial
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+preferences:
+  flash_write_interval: 5min
+logger:
+api:
+wifi:
+  ssid: "test-ssid"
+  password: "test-password"

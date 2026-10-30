@@ -1,0 +1,9 @@
+---
+# Calibrating over less than one turn (2 s at 0.2 turn/s) must fail, not store a bad calibration.
+packages:
+  sim: !include sim-host.yaml
+substitutions:
+  sim_name: magdial-sim-partial
+  calibration_seconds_initial_value: '2'
+  sim_duration_seconds: '20'
+  sim_expect_calibration: 'false'

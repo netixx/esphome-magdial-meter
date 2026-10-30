@@ -1,0 +1,126 @@
+---
+# Runs the meter logic on the host against a simulated rotating magnet, and exits
+# with status 0 if the outcome matches the expectation, 1 otherwise:
+#   esphome compile tests/sim-host.yaml
+#   tests/.esphome/build/magdial-sim/.pioenvs/magdial-sim/program
+# Calibration starts by itself; the log compares counted vs simulated turns.
+substitutions:
+  calibration_seconds_initial_value: '30'
+  magnetometer_update_interval: 50ms
+  sim_name: magdial-sim
+  sim_duration_seconds: '170'
+  # true: calibration must succeed and counting stay within sim_max_error_turns.
+  # false: calibration must fail.
+  sim_expect_calibration: 'true'
+  # Within-turn error under the exaggerated drift below; it must not accumulate.
+  sim_max_error_turns: '0.1'
+
+esphome:
+  name: ${sim_name}
+
+host:
+
+logger:
+  level: DEBUG
+  logs:
+    sensor: INFO
+    text_sensor: INFO
+    select: INFO
+    number: INFO
+    switch: INFO
+    script: INFO
+
+api:
+
+packages:
+  meter: !include ../magdial-meter.yaml
+
+i2c: !remove
+
+globals:
+  - id: sim_turns
+    type: double
+    initial_value: '0'
+  - id: sim_seen_calibration
+    type: bool
+    initial_value: 'false'
+  - id: sim_turns_at_ready
+    type: double
+    initial_value: 'NAN'
+  - id: sim_rot_at_ready
+    type: double
+    initial_value: '0'
+  - id: sim_max_error
+    type: double
+    initial_value: '0'
+
+sensor:
+  - platform: template
+    id: magnetic_field_x
+    update_interval: never
+  - platform: template
+    id: magnetic_field_y
+    update_interval: never
+  - platform: template
+    id: magnetic_field_z
+    update_interval: never
+    on_raw_value:
+      - script.execute: magdial_process
+
+interval:
+  - interval: ${magnetometer_update_interval}
+    then:
+      - lambda: |-
+          // Host millis() does not start at 0
+          static const uint32_t start = millis();
+          const float t = (millis() - start) / 1000.0f;
+          // Flow profile in turns per second (the magnet spins "backwards" to exercise direction detection)
+          float rate = 0;
+          if (t > 5 && t < 60) rate = -0.2f;         // calibration + direction detection
+          else if (t > 70 && t < 100) rate = -0.5f;  // fast flow
+          else if (t > 110 && t < 160) rate = -0.03f;  // slow flow
+          id(sim_turns) += rate * 0.05;
+          const float th = 2.0f * M_PI * id(sim_turns);
+          // Thermal drift of the offsets (much faster than real), plus noise
+          const float drift = 4.0f * sinf(t / 40.0f);
+          auto noise = []() { return (random_float() - 0.5f) * 1.5f; };
+          id(magnetic_field_x).publish_state(20 + drift + 25 * cosf(th) + noise());
+          id(magnetic_field_y).publish_state(-40 + 15 * cosf(th - 1.0f) + noise());
+          id(magnetic_field_z).publish_state(5 - drift + 30 * cosf(th + 2.5f) + noise());
+
+  - interval: 5s
+    then:
+      - lambda: |-
+          static const uint32_t start = millis();
+          const uint32_t t = (millis() - start) / 1000;
+          if (id(magdial_cal_phase) != 0) id(sim_seen_calibration) = true;
+          const bool ready = id(magdial_calibration_status).state == "Ready";
+          // Baseline once this run's own calibration has completed
+          if (std::isnan(id(sim_turns_at_ready)) && id(sim_seen_calibration) && ready) {
+            id(sim_turns_at_ready) = id(sim_turns);
+            id(sim_rot_at_ready) = id(magdial_rotations_total);
+          }
+          if (!std::isnan(id(sim_turns_at_ready))) {
+            const double sim = -(id(sim_turns) - id(sim_turns_at_ready));
+            const double got = id(magdial_rotations_total) - id(sim_rot_at_ready);
+            id(sim_max_error) = std::max(id(sim_max_error), fabs(got - sim));
+            ESP_LOGI("sim", "t=%us simulated %.3f turns, counted %.3f, error %.3f, quality %.0f%%, flow %.2f",
+                     t, sim, got, got - sim, id(magdial_signal_quality) * 100, id(magdial_flow).state);
+          }
+          if (t < ${sim_duration_seconds}) return;
+
+          const std::string status = id(magdial_calibration_status).state;
+          bool ok;
+          if (${sim_expect_calibration}) {
+            ok = !std::isnan(id(sim_turns_at_ready)) && id(sim_max_error) < ${sim_max_error_turns};
+          } else {
+            ok = id(sim_seen_calibration) && status.rfind("Failed", 0) == 0;
+          }
+          ESP_LOGI("sim", "%s: status '%s', max error %.3f turns", ok ? "PASS" : "FAIL", status.c_str(),
+                   id(sim_max_error));
+          exit(ok ? 0 : 1);
+
+  - interval: 1h
+    startup_delay: 3s
+    then:
+      - script.execute: magdial_calibrate

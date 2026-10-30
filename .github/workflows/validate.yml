@@ -1,0 +1,40 @@
+---
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install ESPHome and yamllint
+        run: pip install esphome yamllint
+
+      - name: Lint YAML
+        run: yamllint .
+
+      - name: Validate every driver config
+        run: esphome config tests/test-*.yaml
+
+      # Compile the meter logic for the host and run it against a simulated
+      # magnet; each simulation exits non-zero if its expectation is not met.
+      - name: Simulation, full run
+        run: |
+          esphome compile tests/sim-host.yaml
+          cd tests && ./.esphome/build/magdial-sim/.pioenvs/magdial-sim/program
+
+      - name: Simulation, calibration over a partial turn must fail
+        run: |
+          esphome compile tests/sim-partial-turn.yaml
+          cd tests && ./.esphome/build/magdial-sim-partial/.pioenvs/magdial-sim-partial/program

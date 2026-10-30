@@ -1,0 +1,5 @@
+---
+packages:
+  base: !include base-esp32.yaml
+  meter: !include ../magdial-meter.yaml
+  driver: !include ../drivers/mmc5603.yaml

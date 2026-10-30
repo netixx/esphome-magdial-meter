@@ -1,0 +1,39 @@
+---
+# QMC5883L, native ESPHome driver. https://esphome.io/components/sensor/qmc5883l/
+# If the field saturates (flat tops in the debug graphs), set range: 800µT with !extend.
+logger:
+  logs:
+    qmc5883l: INFO
+
+sensor:
+  - platform: qmc5883l
+    id: magnetometer
+    i2c_id: magdial_i2c
+    update_interval: ${magnetometer_update_interval}
+    address: 0x0D
+    oversampling: 512x
+    range: 200µT
+    field_strength_x:
+      id: magnetic_field_x
+      name: Magnetic field X
+      entity_category: diagnostic
+      internal: ${hide_debug_sensors}
+      filters:
+        - throttle_average: ${debug_update_interval}
+    field_strength_y:
+      id: magnetic_field_y
+      name: Magnetic field Y
+      entity_category: diagnostic
+      internal: ${hide_debug_sensors}
+      filters:
+        - throttle_average: ${debug_update_interval}
+    field_strength_z:
+      id: magnetic_field_z
+      name: Magnetic field Z
+      entity_category: diagnostic
+      internal: ${hide_debug_sensors}
+      filters:
+        - throttle_average: ${debug_update_interval}
+      # Drivers publish X, Y, then Z: by now all three axes hold this sample.
+      on_raw_value:
+        - script.execute: magdial_process
