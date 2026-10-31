@@ -1,32 +1,34 @@
 ---
 # MMC5603, native ESPHome driver. https://esphome.io/components/sensor/mmc5603/
+# Fixed address 0x30: one per bus (use another bus or a TCA9548A for more).
+# Included by magdial-meter.yaml (driver: mmc5603), with that meter's vars.
 sensor:
   - platform: mmc5603
-    id: magnetometer
-    i2c_id: magdial_i2c
+    id: ${id_prefix}magnetometer
+    i2c_id: ${i2c_id}
+    address: ${i2c_address or '0x30'}
     update_interval: ${magnetometer_update_interval}
-    address: 0x30
     field_strength_x:
-      id: magnetic_field_x
-      name: Magnetic field X
+      id: ${id_prefix}magnetic_field_x
+      name: ${name_prefix}Magnetic field X
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
     field_strength_y:
-      id: magnetic_field_y
-      name: Magnetic field Y
+      id: ${id_prefix}magnetic_field_y
+      name: ${name_prefix}Magnetic field Y
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
     field_strength_z:
-      id: magnetic_field_z
-      name: Magnetic field Z
+      id: ${id_prefix}magnetic_field_z
+      name: ${name_prefix}Magnetic field Z
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
       # Drivers publish X, Y, then Z: by now all three axes hold this sample.
       on_raw_value:
-        - script.execute: magdial_process
+        - script.execute: ${id_prefix}magdial_process

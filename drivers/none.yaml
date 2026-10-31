@@ -1,0 +1,6 @@
+---
+# No driver: bring your own magnetometer. Define three sensors with ids
+# ${id_prefix}magnetic_field_x / _y / _z (µT), and on the last one published for each sample:
+#   on_raw_value:
+#     - script.execute: ${id_prefix}magdial_process
+{}

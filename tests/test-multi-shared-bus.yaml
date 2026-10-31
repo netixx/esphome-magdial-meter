@@ -1,0 +1,13 @@
+---
+# Three meters on one bus: chips with different fixed addresses (0x0D, 0x1E, 0x30).
+packages:
+  base: !include base-esp32.yaml
+  cold: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: cold_, name_prefix: 'Cold water ', driver: qmc5883l}
+  hot: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: hot_, name_prefix: 'Hot water ', driver: hmc5883l}
+  garden: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: garden_, name_prefix: 'Garden ', driver: mmc5603, volume_per_rotation_initial_value: '1'}

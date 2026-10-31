@@ -1,35 +1,37 @@
 ---
 # HMC5883L, native ESPHome driver. https://esphome.io/components/sensor/hmc5883l/
+# Fixed address 0x1E: one per bus (use another bus or a TCA9548A for more).
+# Included by magdial-meter.yaml (driver: hmc5883l), with that meter's vars.
 sensor:
   - platform: hmc5883l
-    id: magnetometer
-    i2c_id: magdial_i2c
+    id: ${id_prefix}magnetometer
+    i2c_id: ${i2c_id}
+    address: ${i2c_address or '0x1E'}
     update_interval: ${magnetometer_update_interval}
-    address: 0x1E
     oversampling: 8x
     # Widest range: a magnet close to the sensor easily exceeds the 130µT default
     range: 810µT
     field_strength_x:
-      id: magnetic_field_x
-      name: Magnetic field X
+      id: ${id_prefix}magnetic_field_x
+      name: ${name_prefix}Magnetic field X
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
     field_strength_y:
-      id: magnetic_field_y
-      name: Magnetic field Y
+      id: ${id_prefix}magnetic_field_y
+      name: ${name_prefix}Magnetic field Y
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
     field_strength_z:
-      id: magnetic_field_z
-      name: Magnetic field Z
+      id: ${id_prefix}magnetic_field_z
+      name: ${name_prefix}Magnetic field Z
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
       # Drivers publish X, Y, then Z: by now all three axes hold this sample.
       on_raw_value:
-        - script.execute: magdial_process
+        - script.execute: ${id_prefix}magdial_process

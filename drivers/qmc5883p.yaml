@@ -1,39 +1,41 @@
 ---
 # QMC5883P, not supported natively by ESPHome: uses the external component
 # also used by tronikos/esphome-magnetometer-water-gas-meter.
+# Fixed address 0x2C: one per bus (use another bus or a TCA9548A for more).
+# Included by magdial-meter.yaml (driver: qmc5883p), with that meter's vars.
 external_components:
   - source: github://mazzhead/esphome-components@ee83bb9d7faadff40c1788309b442fe14cb2ddb6
     components: [qmc5883p]
 
 sensor:
   - platform: qmc5883p
-    id: magnetometer
-    i2c_id: magdial_i2c
+    id: ${id_prefix}magnetometer
+    i2c_id: ${i2c_id}
+    address: ${i2c_address or '0x2C'}
     update_interval: ${magnetometer_update_interval}
-    address: 0x2C
     oversampling: 8x
     noise_level: 8x
     field_strength_x:
-      id: magnetic_field_x
-      name: Magnetic field X
+      id: ${id_prefix}magnetic_field_x
+      name: ${name_prefix}Magnetic field X
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
     field_strength_y:
-      id: magnetic_field_y
-      name: Magnetic field Y
+      id: ${id_prefix}magnetic_field_y
+      name: ${name_prefix}Magnetic field Y
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
     field_strength_z:
-      id: magnetic_field_z
-      name: Magnetic field Z
+      id: ${id_prefix}magnetic_field_z
+      name: ${name_prefix}Magnetic field Z
       entity_category: diagnostic
       internal: ${hide_debug_sensors}
       filters:
         - throttle_average: ${debug_update_interval}
       # Drivers publish X, Y, then Z: by now all three axes hold this sample.
       on_raw_value:
-        - script.execute: magdial_process
+        - script.execute: ${id_prefix}magdial_process

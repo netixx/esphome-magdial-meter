@@ -16,18 +16,24 @@ from two axes instead, so it:
 
 ## Installation
 
+Declare the I²C bus in your device config, then include the package once per meter:
+
 ```yaml
-substitutions:
-  volume_unit: 'L'
-  volume_per_rotation_initial_value: '10'
-  i2c_sda: GPIO13
-  i2c_scl: GPIO16
+i2c:
+  - id: i2c_bus
+    sda: GPIO13
+    scl: GPIO16
+    frequency: 100kHz
 
 packages:
-  meter:
+  water:
     url: https://github.com/netixx/esphome-magdial-meter
     ref: main
-    files: [magdial-meter.yaml, drivers/qmc5883p.yaml]
+    files:
+      - path: magdial-meter.yaml
+        vars:
+          driver: qmc5883p
+          volume_per_rotation_initial_value: '10'
     refresh: 1d
 
 preferences:
@@ -38,26 +44,29 @@ The counter and calibration are saved to flash at most every `flash_write_interv
 also set `esp8266: restore_from_flash: true`, otherwise they are kept in RTC memory and lost on
 power loss.
 
-Pick exactly one driver:
+Your config must have an `api:` block (the package adds a `set_total` action to it). See
+[example-esp32.yaml](example-esp32.yaml) for a full device config.
 
-| Driver file | Chip | Notes |
-| --- | --- | --- |
-| `drivers/qmc5883l.yaml` | QMC5883L | native ESPHome |
-| `drivers/qmc5883p.yaml` | QMC5883P | external component [mazzhead/esphome-components](https://github.com/mazzhead/esphome-components) (same as tronikos) |
-| `drivers/hmc5883l.yaml` | HMC5883L | native ESPHome |
-| `drivers/mmc5603.yaml` | MMC5603 | native ESPHome |
-| `drivers/mlx90393.yaml` | MLX90393 | native ESPHome. Adafruit boards since 2023 use address 0x18, see the file |
+### Drivers
 
-Driver options can be overridden from your config, e.g. a wider range if the field saturates:
+Set the `driver` var of each meter:
+
+| `driver` | Chip | Address | Notes |
+| --- | --- | --- | --- |
+| `qmc5883l` | QMC5883L (most GY-271 boards) | 0x0D | native ESPHome |
+| `qmc5883p` | QMC5883P (newer GY-271 boards) | 0x2C | external component [mazzhead/esphome-components](https://github.com/mazzhead/esphome-components) (same as tronikos) |
+| `hmc5883l` | HMC5883L | 0x1E | native ESPHome |
+| `mmc5603` | MMC5603 | 0x30 | native ESPHome |
+| `mlx90393` | MLX90393 | 0x0C | native ESPHome. Adafruit boards since 2023 use 0x18: set `i2c_address: '0x18'` |
+| `none` | your own | | define the 3 axis sensors yourself, see [drivers/none.yaml](drivers/none.yaml) |
+
+Driver options can be overridden from your config, e.g. for a meter with `id_prefix: cold_`:
 
 ```yaml
 sensor:
-  - id: !extend magnetometer
-    range: 800µT
+  - id: !extend cold_magnetometer
+    oversampling: 4x
 ```
-
-Your config must have an `api:` block (the package adds the `set_total` action to it). See
-[example-esp32.yaml](example-esp32.yaml) for a full device config.
 
 The package sets no log levels, so it works with any `logger:` level. At the default `DEBUG` level
 the driver logs every sample; quiet it with a per-driver level:
@@ -69,13 +78,92 @@ logger:
     qmc5883p: INFO  # or qmc5883l, hmc5883l, mmc5603, mlx90393
 ```
 
-### Substitutions
+### Several meters on one device
 
-| Substitution | Default | Meaning |
+Include `magdial-meter.yaml` once per meter, each with a unique `id_prefix` and its own
+`name_prefix`, bus and driver.
+
+**How many?** Up to **4 meters** per ESP32 comfortably, **8 at most** (one TCA9548A). On an
+ESP8266, 2. The limits are I²C wiring and the number of entities, not CPU. Estimated cost per
+meter at the default 20 samples per second (estimates, not measured on hardware; 3 meters are
+tested in simulation):
+
+| Resource | Per meter | 8 meters | Note |
+| --- | --- | --- | --- |
+| I²C bus time (100 kHz, ~1 ms per read incl. multiplexer switch) | ~2.5 % | ~20 % | 400 kHz divides it by ~3 |
+| Main loop blocked by I²C reads | ~20 ms/s | ~160 ms/s | reads are blocking; still fine for Wi-Fi, Ethernet and the API |
+| CPU for the processing | < 1 % | < 5 % | |
+| RAM | ~2.5 KB, +2.4 KB while calibrating | ~20 KB, +19 KB if all calibrate at once | an ESP32 has ~200 KB free |
+| Flash (code is generated per meter) | ~20 KB | ~160 KB | the app slot is ~1.8 MB |
+| Home Assistant entities | ~30, ~20 of them diagnostic | ~240 | set `hide_debug_sensors: 'true'` once set up |
+
+Recommendations:
+
+- **Wiring is the real limit.** Each sensor sits at its meter, often metres away. Several long
+  cables on one bus exceed the I²C capacitance budget and cause read errors. A TCA9548A puts each
+  cable on its own segment: use one beyond 2 meters, or as soon as cables are long. Keep the bus
+  at 100 kHz (or lower for long runs) and use twisted pair (e.g. CAT6) for each sensor cable.
+- **Calibrate one meter at a time**: it needs water running through that meter only anyway, and
+  it keeps the RAM peak low.
+- **Keep `magnetometer_update_interval` at 50 ms** unless a dial turns faster than ~2 turns per
+  second; halving it doubles the bus time.
+- **More than 8**: chaining multiplexers works, but a second ESP is simpler and isolates faults.
+
+The magnetometers have a **fixed I²C address**, so two identical chips cannot share a bus (ESPHome
+does not detect it; the readings would be garbage). Options:
+
+- **Different chips on one bus**: e.g. a QMC5883P (0x2C), a QMC5883L (0x0D) and an HMC5883L (0x1E).
+- **One bus per chip**: the ESP32 has 2 hardware I²C controllers (the ESP32-C3 only 1).
+- **A TCA9548A multiplexer** (address 0x70): up to 8 identical chips on one bus, one per channel.
+  Each channel is a bus id for the meters.
+
+```yaml
+i2c:
+  - id: i2c_bus
+    sda: GPIO13
+    scl: GPIO16
+
+tca9548a:
+  - address: 0x70
+    i2c_id: i2c_bus
+    channels:
+      - {bus_id: mux_0, channel: 0}
+      - {bus_id: mux_1, channel: 1}
+      - {bus_id: mux_2, channel: 2}
+
+packages:
+  meters:
+    url: https://github.com/netixx/esphome-magdial-meter
+    ref: main
+    files:
+      - path: magdial-meter.yaml
+        vars: {id_prefix: cold_, name_prefix: 'Cold water ', driver: qmc5883p, i2c_id: mux_0}
+      - path: magdial-meter.yaml
+        vars: {id_prefix: hot_, name_prefix: 'Hot water ', driver: qmc5883p, i2c_id: mux_1}
+      - path: magdial-meter.yaml
+        vars: {id_prefix: garden_, name_prefix: 'Garden ', driver: qmc5883p, i2c_id: mux_2,
+               volume_per_rotation_initial_value: '1'}
+    refresh: 1d
+```
+
+Each meter gets its own entities ("Cold water Total", ...), calibration and `set_total` action
+(`esphome.<device>_cold_set_total`). See
+[example-esp32-three-meters.yaml](example-esp32-three-meters.yaml).
+
+### Vars
+
+Set per meter in `vars:`:
+
+| Var | Default | Meaning |
 | --- | --- | --- |
+| `id_prefix` | `''` | Prefix of every id and of the `set_total` action. Unique per meter, e.g. `cold_` |
+| `name_prefix` | `''` | Prefix of every entity name, e.g. `'Cold water '` |
+| `driver` | `qmc5883l` | Magnetometer driver, see [Drivers](#drivers) |
+| `i2c_id` | `i2c_bus` | Bus (or TCA9548A channel) of the magnetometer |
+| `i2c_address` | `''` | Override the driver's default address |
 | `volume_unit` | `L` | Unit of Total, Flow and Volume per rotation |
+| `device_class`, `device_icon` | `water`, `mdi:water` | e.g. `gas`, `mdi:meter-gas` |
 | `volume_per_rotation_initial_value` | `10` | Volume of one full turn of the magnet. Editable in HA afterwards |
-| `i2c_sda`, `i2c_scl`, `i2c_frequency` | `GPIO4`, `GPIO5`, `50kHz` | I²C bus. Lower the frequency for long cables |
 | `magnetometer_update_interval` | `50ms` | Sampling period, see [Sampling rate](#sampling-rate) |
 | `calibration_seconds_initial_value` | `180` | Initial calibration time. Editable in HA afterwards |
 | `calibration_min_amplitude_initial_value` | `10` | Minimum half-amplitude (µT) of a usable axis. Editable in HA |
@@ -85,8 +173,8 @@ logger:
 | `flow_deadband_rotations` | `0.01` | Movement (turns) below which Flow reads 0 |
 | `adapt_rate` | `0.1` | Weight of each complete turn in adaptive calibration |
 
-Values marked "editable in HA" are restored from flash: changing the substitution later only
-affects a freshly flashed device. Change them in Home Assistant instead.
+Values marked "editable in HA" are restored from flash: changing the var later only affects a
+freshly flashed device. Change them in Home Assistant instead.
 
 ## Home Assistant entities
 
@@ -242,6 +330,9 @@ Changing **Volume per rotation** keeps Total as it is: the new value applies to 
   full run, calibration over a partial turn, long calibration at high flow, and the learned
   angle mapping under random flow with stops.
 
+- `test-multi-*.yaml` and `sim-multi.yaml`: three meters on one device (shared bus, two buses,
+  TCA9548A), and three simulated meters calibrating and counting independently.
+
 Each replay and simulation compiles for the host and exits non-zero on failure:
 
 ```sh
@@ -249,7 +340,7 @@ pip install esphome
 esphome config tests/test-*.yaml
 for t in replay-real-log:magdial-replay replay-real-log-short:magdial-replay-short \
          sim-host:magdial-sim sim-partial-turn:magdial-sim-partial sim-long-calibration:magdial-sim-long \
-         sim-learned-curve:magdial-sim-learned; do
+         sim-learned-curve:magdial-sim-learned sim-multi:magdial-sim-multi; do
   esphome compile tests/${t%%:*}.yaml && (cd tests && .esphome/build/${t##*:}/.pioenvs/${t##*:}/program) || break
 done
 ```

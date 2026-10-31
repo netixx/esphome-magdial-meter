@@ -55,9 +55,12 @@ logger:
 api:
 
 packages:
-  meter: !include ../magdial-meter.yaml
-
-i2c: !remove
+  meter: !include
+    file: ../magdial-meter.yaml
+    vars:
+      driver: none
+      calibration_seconds_initial_value: ${calibration_seconds_initial_value}
+      magnetometer_update_interval: ${magnetometer_update_interval}
 
 globals:
   - id: sim_turns

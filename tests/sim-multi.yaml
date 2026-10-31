@@ -1,0 +1,135 @@
+---
+# Three meters on one device, each fed by its own simulated magnet (different speeds, one
+# turning the other way). All calibrate at once; each must then count its own magnet only.
+# Exits 0 on success, 1 otherwise:
+#   esphome compile tests/sim-multi.yaml
+#   tests/.esphome/build/magdial-sim-multi/.pioenvs/magdial-sim-multi/program
+
+esphome:
+  name: magdial-sim-multi
+  on_boot:
+    # Host builds keep preferences across runs: start from a clean, uncalibrated state
+    priority: -200
+    then:
+      - lambda: |-
+          for (auto *s : {id(a_magdial_axis_pair), id(b_magdial_axis_pair), id(c_magdial_axis_pair)})
+            s->make_call().set_option("None").perform();
+          for (auto *s : {id(a_magdial_angle_mapping), id(b_magdial_angle_mapping), id(c_magdial_angle_mapping)})
+            s->make_call().set_option("Raw").perform();
+
+host:
+
+logger:
+  level: DEBUG
+  logs:
+    sensor: INFO
+    text_sensor: INFO
+    select: INFO
+    number: INFO
+    switch: INFO
+    script: INFO
+
+api:
+
+packages:
+  a: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: a_, name_prefix: 'A ', driver: none, calibration_seconds_initial_value: '25'}
+  b: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: b_, name_prefix: 'B ', driver: none, calibration_seconds_initial_value: '25'}
+  c: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: c_, name_prefix: 'C ', driver: none, calibration_seconds_initial_value: '25'}
+
+sensor:
+  - {platform: template, id: a_magnetic_field_x, update_interval: never}
+  - {platform: template, id: a_magnetic_field_y, update_interval: never}
+  - platform: template
+    id: a_magnetic_field_z
+    update_interval: never
+    on_raw_value:
+      - script.execute: a_magdial_process
+  - {platform: template, id: b_magnetic_field_x, update_interval: never}
+  - {platform: template, id: b_magnetic_field_y, update_interval: never}
+  - platform: template
+    id: b_magnetic_field_z
+    update_interval: never
+    on_raw_value:
+      - script.execute: b_magdial_process
+  - {platform: template, id: c_magnetic_field_x, update_interval: never}
+  - {platform: template, id: c_magnetic_field_y, update_interval: never}
+  - platform: template
+    id: c_magnetic_field_z
+    update_interval: never
+    on_raw_value:
+      - script.execute: c_magdial_process
+
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static const uint32_t start = millis();
+          const float t = (millis() - start) / 1000.0f;
+          // Turns per second of each magnet while water runs; B turns the other way
+          static const float RATE[3] = {0.25f, -0.4f, 0.1f};
+          static double turns[3] = {0, 0, 0};
+          static double turns_at_ready[3] = {NAN, NAN, NAN}, rot_at_ready[3] = {0, 0, 0};
+          static double last_rel[3] = {0, 0, 0}, max_err[3] = {0, 0, 0};
+          static int checks[3] = {0, 0, 0};
+          sensor::Sensor *fx[3] = {id(a_magnetic_field_x), id(b_magnetic_field_x), id(c_magnetic_field_x)};
+          sensor::Sensor *fy[3] = {id(a_magnetic_field_y), id(b_magnetic_field_y), id(c_magnetic_field_y)};
+          sensor::Sensor *fz[3] = {id(a_magnetic_field_z), id(b_magnetic_field_z), id(c_magnetic_field_z)};
+          double *rot[3] = {&id(a_magdial_rotations_total), &id(b_magdial_rotations_total),
+                            &id(c_magdial_rotations_total)};
+          text_sensor::TextSensor *status[3] = {id(a_magdial_calibration_status), id(b_magdial_calibration_status),
+                                                id(c_magdial_calibration_status)};
+          uint32_t *samples[3] = {&id(a_magdial_cal_samples), &id(b_magdial_cal_samples), &id(c_magdial_cal_samples)};
+
+          for (int m = 0; m < 3; m++) {
+            if (t > 1 && t < 100) turns[m] += RATE[m] * 0.05;
+            // Orbiting dipole, each meter with its own geometry
+            const float th = 2.0f * M_PI * turns[m];
+            const float tilt = 0.25f + 0.2f * m, dist = 14.0f + 2.0f * m;
+            const float mo[3] = {cosf(th + 0.6f * m), sinf(th + 0.6f * m), tilt};
+            const float r[3] = {dist - 6.0f * cosf(th), -6.0f * sinf(th), 8.0f};
+            const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+            const float md = (mo[0] * r[0] + mo[1] * r[1] + mo[2] * r[2]) / rn;
+            float f[3];
+            for (int i = 0; i < 3; i++) f[i] = 6e5f * (3 * md * r[i] / rn - mo[i]) / (rn * rn * rn);
+            auto noise = []() { return (random_float() - 0.5f) * 1.5f; };
+            fx[m]->publish_state(20 + f[0] + noise());
+            fy[m]->publish_state(-5 + f[1] + noise());
+            fz[m]->publish_state(40 + f[2] + noise());
+
+            // Whole-turn check from where counting started (Raw mapping: exact there)
+            if (*samples[m] == 0 || status[m]->state != "Ready") continue;
+            if (std::isnan(turns_at_ready[m])) {
+              turns_at_ready[m] = turns[m];
+              rot_at_ready[m] = *rot[m];
+            }
+            const double rel = fabs(turns[m] - turns_at_ready[m]);
+            if (floor(rel) != floor(last_rel[m])) {
+              max_err[m] = std::max(max_err[m], fabs(*rot[m] - rot_at_ready[m] - rel));
+              checks[m]++;
+            }
+            last_rel[m] = rel;
+          }
+
+          if (t < 110) return;
+          bool ok = true;
+          for (int m = 0; m < 3; m++) {
+            const bool meter_ok = checks[m] >= 5 && max_err[m] < 0.1;
+            ESP_LOGI("sim", "Meter %c: %s, %d turn checks, max error %.3f turn, status '%s'", 'A' + m,
+                     meter_ok ? "ok" : "FAILED", checks[m], max_err[m], status[m]->state.c_str());
+            ok = ok && meter_ok;
+          }
+          ESP_LOGI("sim", "%s", ok ? "PASS" : "FAIL");
+          exit(ok ? 0 : 1);
+
+  - interval: 1h
+    startup_delay: 3s
+    then:
+      - script.execute: a_magdial_calibrate
+      - script.execute: b_magdial_calibrate
+      - script.execute: c_magdial_calibrate

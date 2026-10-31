@@ -2,8 +2,9 @@
 # Read a meter dial (e.g. a water meter whose magnet turns once per 10 L) by
 # tracking the angle of its rotating magnet with a 3-axis magnetometer.
 #
-# Not standalone: combine with exactly one file from drivers/ that defines the
-# magnetometer sensor. See README.md.
+# One meter per include: include this file once per meter, each with its own vars
+# (id_prefix, name_prefix, i2c_id, driver, ...). The I2C buses are declared by the device
+# config. See README.md.
 #
 # How it works:
 #   Each turn of the magnet makes the field vector trace a closed loop. Seen
@@ -16,18 +17,24 @@
 #   made on the shape of the signal: a magnet close to the sensor gives sharp,
 #   far from sinusoidal peaks, which is fine.
 
-substitutions:
+defaults:
+  # Per meter: prefix of every id (and of the set_total action), e.g. 'cold_'. Must be unique.
+  id_prefix: ''
+  # Per meter: prefix of every entity name, e.g. 'Cold water '
+  name_prefix: ''
+  # I2C bus (id declared in the device config) and magnetometer driver: a file name in
+  # drivers/ (qmc5883l, qmc5883p, hmc5883l, mmc5603, mlx90393, or none to bring your own)
+  i2c_id: i2c_bus
+  driver: qmc5883l
+  # Override the driver's default I2C address, e.g. 0x18 for recent Adafruit MLX90393 ('' = default)
+  i2c_address: ''
+
   # For water one of: CCF, ft³, gal, L, m³
   volume_unit: 'L'
   device_class: 'water'
   device_icon: 'mdi:water'
   total_accuracy_decimals: '2'
   flow_accuracy_decimals: '2'
-
-  i2c_scl: GPIO5
-  i2c_sda: GPIO4
-  i2c_frequency: 50kHz
-  i2c_scan: 'false'
 
   # Sample at least ~10x per turn at the highest flow you expect. The dial must
   # move less than half a turn between two samples or turns are miscounted.
@@ -57,167 +64,176 @@ substitutions:
   # observed, to follow temperature drift (only when "Adaptive calibration" is on).
   adapt_rate: '0.1'
 
+packages:
+  driver: !include drivers/${driver}.yaml
+
 esphome:
   on_boot:
-    priority: -100
-    then:
-      - script.execute: magdial_publish_status
-
-i2c:
-  - id: magdial_i2c
-    scl: ${i2c_scl}
-    sda: ${i2c_sda}
-    frequency: ${i2c_frequency}
-    scan: ${i2c_scan}
+    - priority: -100
+      then:
+        - script.execute: ${id_prefix}magdial_publish_status
 
 api:
   actions:
     # Make Total match the reading on the physical meter.
-    - action: set_total
+    - action: ${id_prefix}set_total
       variables:
         new_total: float
       then:
         - lambda: |-
-            id(magdial_volume_offset) =
-                new_total - id(magdial_rotations_total) * id(magdial_volume_per_rotation).state;
-            id(magdial_total_published) = new_total;
-            id(magdial_total).publish_state(new_total);
+            id(${id_prefix}magdial_volume_offset) =
+                new_total - id(${id_prefix}magdial_rotations_total) * id(${id_prefix}magdial_volume_per_rotation).state;
+            id(${id_prefix}magdial_total_published) = new_total;
+            id(${id_prefix}magdial_total).publish_state(new_total);
 
 globals:
   # --- Persistent counting state ---
   # Signed number of dial turns since forever (fractional).
-  - id: magdial_rotations_total
+  - id: ${id_prefix}magdial_rotations_total
     type: double
     restore_value: true
     initial_value: '0'
-  - id: magdial_volume_offset
+  - id: ${id_prefix}magdial_volume_offset
     type: double
     restore_value: true
     initial_value: '0'
   # Volume per rotation the offset was computed with, to keep Total when it changes
-  - id: magdial_volume_per_rotation_applied
+  - id: ${id_prefix}magdial_volume_per_rotation_applied
     type: float
     restore_value: true
     initial_value: 'NAN'
   # Highest Total ever published: Total is total_increasing and must never go down.
-  - id: magdial_total_published
+  - id: ${id_prefix}magdial_total_published
     type: double
     restore_value: true
     initial_value: '0'
 
   # --- Persistent calibration, per axis x, y, z ---
-  - id: magdial_center
+  - id: ${id_prefix}magdial_center
     type: std::array<float, 3>
     restore_value: true
-  - id: magdial_amplitude
+  - id: ${id_prefix}magdial_amplitude
     type: std::array<float, 3>
     restore_value: true
   # Rotation direction (+1/-1) of each pair x/y, x/z, y/z, from the calibration winding.
   # 0: the pair failed validation and is never used for counting.
-  - id: magdial_pair_sign
+  - id: ${id_prefix}magdial_pair_sign
     type: std::array<float, 3>
     restore_value: true
     initial_value: '{{0, 0, 0}}'
 
   # --- Calibration runtime state ---
   # 0 idle, 1 recording
-  - id: magdial_cal_phase
+  - id: ${id_prefix}magdial_cal_phase
     type: int
     initial_value: '0'
-  - id: magdial_cal_finish
+  - id: ${id_prefix}magdial_cal_finish
     type: bool
     initial_value: 'false'
-  - id: magdial_cal_samples
+  - id: ${id_prefix}magdial_cal_samples
     type: uint32_t
     initial_value: '0'
-  - id: magdial_cal_lo
+  - id: ${id_prefix}magdial_cal_lo
     type: std::array<float, 3>
-  - id: magdial_cal_hi
+  - id: ${id_prefix}magdial_cal_hi
     type: std::array<float, 3>
   # Trajectory of the field during calibration in 0.1 µT units, at most 400 points
-  - id: magdial_cal_points
+  - id: ${id_prefix}magdial_cal_points
     type: std::vector<std::array<int16_t, 3>>
   # Grows x2 each time the trajectory is thinned
-  - id: magdial_cal_thin
+  - id: ${id_prefix}magdial_cal_thin
     type: float
     initial_value: '1'
   # Turns seen by the last successful calibration (diagnostic)
-  - id: magdial_cal_turns
+  - id: ${id_prefix}magdial_cal_turns
     type: float
     initial_value: '0'
 
   # --- Tracking runtime state ---
-  - id: magdial_have_last
+  # Last two raw samples per axis, for the median-of-3 glitch filter
+  - id: ${id_prefix}magdial_median_hist
+    type: std::array<std::array<float, 2>, 3>
+  - id: ${id_prefix}magdial_median_count
+    type: int
+    initial_value: '0'
+  # Flow computation baseline
+  - id: ${id_prefix}magdial_flow_last_rot
+    type: double
+    initial_value: 'NAN'
+  - id: ${id_prefix}magdial_flow_last_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: ${id_prefix}magdial_have_last
     type: bool
     initial_value: 'false'
   # Last raw dial angle in turns, -0.5..0.5
-  - id: magdial_last_angle
+  - id: ${id_prefix}magdial_last_angle
     type: float
     initial_value: '0'
   # Smallest distance of the loop from its center over the last complete turn
   # (1.0 = the amplitude). Noise must stay well below it.
-  - id: magdial_clearance
+  - id: ${id_prefix}magdial_clearance
     type: float
     initial_value: 'NAN'
-  - id: magdial_turn_clearance
+  - id: ${id_prefix}magdial_turn_clearance
     type: float
     initial_value: 'NAN'
   # Per-turn extremes for adaptive calibration
-  - id: magdial_turn_lo
+  - id: ${id_prefix}magdial_turn_lo
     type: std::array<float, 3>
-  - id: magdial_turn_hi
+  - id: ${id_prefix}magdial_turn_hi
     type: std::array<float, 3>
-  - id: magdial_turn_tracking
+  - id: ${id_prefix}magdial_turn_tracking
     type: bool
     initial_value: 'false'
-  - id: magdial_last_full_turn
+  - id: ${id_prefix}magdial_last_full_turn
     type: double
     initial_value: '0'
 
   # --- Learned angle mapping ---
   # Raw angle (0..1, forward) where the dial has done 1/10, 2/10, ... 9/10 of a turn.
-  - id: magdial_curve
+  - id: ${id_prefix}magdial_curve
     type: std::array<float, 9>
     restore_value: true
     initial_value: '{{0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f}}'
   # Complete turns the curve was learned from (capped at 15); used once >= 3
-  - id: magdial_curve_turns
+  - id: ${id_prefix}magdial_curve_turns
     type: int
     restore_value: true
     initial_value: '0'
   # Mapping in use, only changed at a turn boundary where Raw and Learned agree
-  - id: magdial_curve_active
+  - id: ${id_prefix}magdial_curve_active
     type: bool
     initial_value: 'false'
-  - id: magdial_last_raw
+  - id: ${id_prefix}magdial_last_raw
     type: float
     initial_value: '0'
   # Current turn: ms since its start when the raw angle first reached j/100
-  - id: magdial_learn_active
+  - id: ${id_prefix}magdial_learn_active
     type: bool
     initial_value: 'false'
-  - id: magdial_learn_start
+  - id: ${id_prefix}magdial_learn_start
     type: uint32_t
     initial_value: '0'
-  - id: magdial_learn_next
+  - id: ${id_prefix}magdial_learn_next
     type: int
     initial_value: '0'
-  - id: magdial_learn_marks
+  - id: ${id_prefix}magdial_learn_marks
     type: std::array<uint32_t, 100>
   # Breakpoints of the last 15 complete turns; the curve is their median
-  - id: magdial_learn_history
+  - id: ${id_prefix}magdial_learn_history
     type: std::array<std::array<float, 9>, 15>
-  - id: magdial_learn_head
+  - id: ${id_prefix}magdial_learn_head
     type: int
     initial_value: '0'
-  - id: magdial_learn_count
+  - id: ${id_prefix}magdial_learn_count
     type: int
     initial_value: '0'
 
 number:
   - platform: template
-    id: magdial_volume_per_rotation
-    name: Volume per rotation
+    id: ${id_prefix}magdial_volume_per_rotation
+    name: ${name_prefix}Volume per rotation
     entity_category: config
     icon: mdi:rotate-360
     mode: box
@@ -231,15 +247,15 @@ number:
     on_value:
       - lambda: |-
           // Keep Total unchanged: the new value only applies to turns from now on.
-          const float prev = id(magdial_volume_per_rotation_applied);
+          const float prev = id(${id_prefix}magdial_volume_per_rotation_applied);
           if (!std::isnan(prev) && prev != x) {
-            id(magdial_volume_offset) += id(magdial_rotations_total) * (prev - x);
+            id(${id_prefix}magdial_volume_offset) += id(${id_prefix}magdial_rotations_total) * (prev - x);
           }
-          id(magdial_volume_per_rotation_applied) = x;
+          id(${id_prefix}magdial_volume_per_rotation_applied) = x;
 
   - platform: template
-    id: magdial_calibration_time
-    name: Calibration time
+    id: ${id_prefix}magdial_calibration_time
+    name: ${name_prefix}Calibration time
     entity_category: config
     icon: mdi:timer
     mode: box
@@ -252,8 +268,8 @@ number:
     optimistic: true
 
   - platform: template
-    id: magdial_calibration_min_amplitude
-    name: Calibration minimal amplitude
+    id: ${id_prefix}magdial_calibration_min_amplitude
+    name: ${name_prefix}Calibration minimal amplitude
     entity_category: config
     icon: mdi:sine-wave
     mode: box
@@ -268,8 +284,8 @@ number:
 select:
   # Set by calibration; can be overridden by hand without recalibrating.
   - platform: template
-    id: magdial_axis_pair
-    name: Axis pair
+    id: ${id_prefix}magdial_axis_pair
+    name: ${name_prefix}Axis pair
     entity_category: config
     icon: mdi:axis-arrow
     options: [x/y, x/z, y/z, None]
@@ -278,16 +294,16 @@ select:
     optimistic: true
     on_value:
       - lambda: |-
-          id(magdial_have_last) = false;  // angle mapping changed, re-sync
-          if (id(magdial_cal_phase) == 0) id(magdial_publish_status).execute();
+          id(${id_prefix}magdial_have_last) = false;  // angle mapping changed, re-sync
+          if (id(${id_prefix}magdial_cal_phase) == 0) id(${id_prefix}magdial_publish_status).execute();
 
   # Learned: corrected by a curve learned from complete turns, more precise within a turn
   # (falls back to Raw until 3 turns are learned). Raw: angle of the field around its loop
   # center, uneven within a turn when the magnet is close to the sensor. Takes effect at the
   # next turn boundary.
   - platform: template
-    id: magdial_angle_mapping
-    name: Angle mapping
+    id: ${id_prefix}magdial_angle_mapping
+    name: ${name_prefix}Angle mapping
     entity_category: config
     icon: mdi:chart-bell-curve-cumulative
     options: [Learned, Raw]
@@ -297,8 +313,8 @@ select:
 
 switch:
   - platform: template
-    id: magdial_adaptive
-    name: Adaptive calibration
+    id: ${id_prefix}magdial_adaptive
+    name: ${name_prefix}Adaptive calibration
     entity_category: config
     icon: mdi:auto-fix
     restore_mode: RESTORE_DEFAULT_ON
@@ -306,77 +322,77 @@ switch:
 
 button:
   - platform: template
-    name: Calibrate
+    name: ${name_prefix}Calibrate
     entity_category: config
     icon: mdi:tune
     on_press:
-      - script.execute: magdial_calibrate
+      - script.execute: ${id_prefix}magdial_calibrate
 
   - platform: template
-    name: Finish calibration now
+    name: ${name_prefix}Finish calibration now
     entity_category: config
     icon: mdi:check
     on_press:
-      - lambda: id(magdial_cal_finish) = true;
+      - lambda: id(${id_prefix}magdial_cal_finish) = true;
 
   - platform: template
-    name: Cancel calibration
+    name: ${name_prefix}Cancel calibration
     entity_category: config
     icon: mdi:close
     on_press:
-      - script.stop: magdial_calibrate
+      - script.stop: ${id_prefix}magdial_calibrate
       - lambda: |-
-          if (id(magdial_cal_phase) == 0) return;  // nothing running: keep the current status
-          id(magdial_cal_phase) = 0;
-          id(magdial_cal_points).clear();
-          id(magdial_cal_points).shrink_to_fit();
-          id(magdial_have_last) = false;
-          ESP_LOGI("magdial", "Calibration cancelled, previous calibration kept");
-          id(magdial_publish_status).execute();
+          if (id(${id_prefix}magdial_cal_phase) == 0) return;  // nothing running: keep the current status
+          id(${id_prefix}magdial_cal_phase) = 0;
+          id(${id_prefix}magdial_cal_points).clear();
+          id(${id_prefix}magdial_cal_points).shrink_to_fit();
+          id(${id_prefix}magdial_have_last) = false;
+          ESP_LOGI("${id_prefix}magdial", "Calibration cancelled, previous calibration kept");
+          id(${id_prefix}magdial_publish_status).execute();
 
 text_sensor:
   - platform: template
-    id: magdial_calibration_status
-    name: Calibration status
+    id: ${id_prefix}magdial_calibration_status
+    name: ${name_prefix}Calibration status
     entity_category: diagnostic
     icon: mdi:information-outline
     update_interval: never
 
   - platform: template
-    id: magdial_calibration_details
-    name: Calibration details
+    id: ${id_prefix}magdial_calibration_details
+    name: ${name_prefix}Calibration details
     entity_category: diagnostic
     icon: mdi:text-box-outline
     update_interval: never
 
   # Raw angle (degrees) at each tenth of a turn: evenly spaced (36 72 108 ...) = no correction
   - platform: template
-    id: magdial_curve_text
-    name: Learned curve
+    id: ${id_prefix}magdial_curve_text
+    name: ${name_prefix}Learned curve
     entity_category: diagnostic
     icon: mdi:chart-bell-curve-cumulative
     update_interval: never
 
 script:
-  - id: magdial_publish_status
+  - id: ${id_prefix}magdial_publish_status
     then:
       - lambda: |-
-          auto pair = id(magdial_axis_pair).active_index();
-          const bool ready = pair.has_value() && *pair < 3 && id(magdial_pair_sign)[*pair] != 0;
-          id(magdial_calibration_status).publish_state(ready ? "Ready" : "Not calibrated");
+          auto pair = id(${id_prefix}magdial_axis_pair).active_index();
+          const bool ready = pair.has_value() && *pair < 3 && id(${id_prefix}magdial_pair_sign)[*pair] != 0;
+          id(${id_prefix}magdial_calibration_status).publish_state(ready ? "Ready" : "Not calibrated");
 
   # Called by the driver for every magnetometer sample, after X, Y and Z are published.
-  - id: magdial_process
+  - id: ${id_prefix}magdial_process
     mode: single
     then:
       - lambda: |-
-          const float raw[3] = {id(magnetic_field_x).get_raw_state(), id(magnetic_field_y).get_raw_state(),
-                                id(magnetic_field_z).get_raw_state()};
+          const float raw[3] = {id(${id_prefix}magnetic_field_x).get_raw_state(), id(${id_prefix}magnetic_field_y).get_raw_state(),
+                                id(${id_prefix}magnetic_field_z).get_raw_state()};
           if (std::isnan(raw[0]) || std::isnan(raw[1]) || std::isnan(raw[2])) return;
           // Median of the last 3 samples per axis: a single glitch (e.g. I2C error on a long
           // cable) would otherwise inflate the calibration min/max for good.
-          static float hist[3][2];
-          static int n_hist = 0;
+          auto &hist = id(${id_prefix}magdial_median_hist);
+          int &n_hist = id(${id_prefix}magdial_median_count);
           float v[3];
           for (int i = 0; i < 3; i++) {
             const float a = n_hist >= 2 ? hist[i][0] : raw[i], b = n_hist >= 1 ? hist[i][1] : raw[i], c = raw[i];
@@ -387,21 +403,21 @@ script:
           if (n_hist < 2) n_hist++;
 
           // --- Calibration: record the extremes of each axis and the trajectory of the field ---
-          if (id(magdial_cal_phase) == 1) {
-            auto &lo = id(magdial_cal_lo);
-            auto &hi = id(magdial_cal_hi);
+          if (id(${id_prefix}magdial_cal_phase) == 1) {
+            auto &lo = id(${id_prefix}magdial_cal_lo);
+            auto &hi = id(${id_prefix}magdial_cal_hi);
             for (int i = 0; i < 3; i++) {
               lo[i] = std::min(lo[i], v[i]);
               hi[i] = std::max(hi[i], v[i]);
             }
-            id(magdial_cal_samples)++;
+            id(${id_prefix}magdial_cal_samples)++;
             // Keep a point each time an axis moved 1 % of its own range (x thin): a few hundred
             // per turn. Axes that barely move (below the minimal amplitude) do not trigger it.
-            auto &pts = id(magdial_cal_points);
-            const float min_span = 2.0f * id(magdial_calibration_min_amplitude).state;
+            auto &pts = id(${id_prefix}magdial_cal_points);
+            const float min_span = 2.0f * id(${id_prefix}magdial_calibration_min_amplitude).state;
             auto moved = [&](const float *from, const float *to) {
               for (int i = 0; i < 3; i++) {
-                const float step = std::max(hi[i] - lo[i], min_span) / 100.0f * id(magdial_cal_thin);
+                const float step = std::max(hi[i] - lo[i], min_span) / 100.0f * id(${id_prefix}magdial_cal_thin);
                 if (fabsf(to[i] - from[i]) >= step) return true;
               }
               return false;
@@ -418,8 +434,8 @@ script:
             // one step plus one sample apart (at most 16 % of an amplitude per axis at thin 8),
             // so the winding stays exact for any loop with >= 20 % clearance. Past thin 8 the
             // buffer already holds 10+ turns: finish instead.
-            while (pts.size() >= 400 && id(magdial_cal_thin) < 8) {
-              id(magdial_cal_thin) *= 2;
+            while (pts.size() >= 400 && id(${id_prefix}magdial_cal_thin) < 8) {
+              id(${id_prefix}magdial_cal_thin) *= 2;
               size_t k = 1;
               float kept[3], cur[3];
               unpack(pts[0], kept);
@@ -433,7 +449,7 @@ script:
               pts.resize(k);
             }
             if (pts.size() >= 400) {
-              id(magdial_cal_finish) = true;
+              id(${id_prefix}magdial_cal_finish) = true;
               return;
             }
             auto q16 = [](float f) { return (int16_t) std::max(-32768.0f, std::min(32767.0f, roundf(f * 10.0f))); };
@@ -441,27 +457,27 @@ script:
             return;
           }
 
-          auto pair = id(magdial_axis_pair).active_index();
+          auto pair = id(${id_prefix}magdial_axis_pair).active_index();
           if (!pair.has_value() || *pair > 2) return;  // not calibrated
           static const int AXES[3][2] = {{0, 1}, {0, 2}, {1, 2}};
           const int p = *pair, a = AXES[p][0], b = AXES[p][1];
-          auto &center = id(magdial_center);
-          auto &amp = id(magdial_amplitude);
-          if (amp[a] <= 0 || amp[b] <= 0 || id(magdial_pair_sign)[p] == 0) return;  // pair not validated
+          auto &center = id(${id_prefix}magdial_center);
+          auto &amp = id(${id_prefix}magdial_amplitude);
+          if (amp[a] <= 0 || amp[b] <= 0 || id(${id_prefix}magdial_pair_sign)[p] == 0) return;  // pair not validated
 
           // --- Raw dial angle: angle of the normalised field around the center of its loop,
           //     oriented to increase with forward flow, 0..1 turn ---
           const float na = (v[a] - center[a]) / amp[a];
           const float nb = (v[b] - center[b]) / amp[b];
           const float radius = sqrtf(na * na + nb * nb);
-          float r = id(magdial_pair_sign)[p] * atan2f(nb, na) / (2.0f * static_cast<float>(M_PI));
+          float r = id(${id_prefix}magdial_pair_sign)[p] * atan2f(nb, na) / (2.0f * static_cast<float>(M_PI));
           r -= floorf(r);
           const uint32_t now = millis();
 
           // Learned mapping: section k (k/10..(k+1)/10 of a turn) spans raw angles curve[k-1]..curve[k]
           auto map_angle = [&](float x) {
-            if (!id(magdial_curve_active)) return x;
-            const auto &bp = id(magdial_curve);
+            if (!id(${id_prefix}magdial_curve_active)) return x;
+            const auto &bp = id(${id_prefix}magdial_curve);
             float lo = 0;
             for (int k = 0; k < 10; k++) {
               const float hi = k < 9 ? bp[k] : 1.0f;
@@ -471,25 +487,25 @@ script:
             return x;
           };
 
-          if (!id(magdial_have_last)) {
-            id(magdial_curve_active) =
-                id(magdial_angle_mapping).active_index().value_or(0) == 0 && id(magdial_curve_turns) >= 3;
-            id(magdial_last_raw) = r;
-            id(magdial_last_angle) = map_angle(r);
-            id(magdial_have_last) = true;
-            id(magdial_learn_active) = false;
-            id(magdial_turn_tracking) = false;
-            id(magdial_turn_clearance) = radius;
-            id(magdial_last_full_turn) = floor(id(magdial_rotations_total));
+          if (!id(${id_prefix}magdial_have_last)) {
+            id(${id_prefix}magdial_curve_active) =
+                id(${id_prefix}magdial_angle_mapping).active_index().value_or(0) == 0 && id(${id_prefix}magdial_curve_turns) >= 3;
+            id(${id_prefix}magdial_last_raw) = r;
+            id(${id_prefix}magdial_last_angle) = map_angle(r);
+            id(${id_prefix}magdial_have_last) = true;
+            id(${id_prefix}magdial_learn_active) = false;
+            id(${id_prefix}magdial_turn_tracking) = false;
+            id(${id_prefix}magdial_turn_clearance) = radius;
+            id(${id_prefix}magdial_last_full_turn) = floor(id(${id_prefix}magdial_rotations_total));
             return;
           }
-          const float last_r = id(magdial_last_raw);
-          id(magdial_last_raw) = r;
+          const float last_r = id(${id_prefix}magdial_last_raw);
+          id(${id_prefix}magdial_last_raw) = r;
           float dr = r - last_r;
           if (dr > 0.5f) dr -= 1.0f;
           else if (dr < -0.5f) dr += 1.0f;
           if (fabsf(dr) > 0.3f) {
-            ESP_LOGW("magdial", "Dial moved %.0f° between two samples, turns may be missed: "
+            ESP_LOGW("${id_prefix}magdial", "Dial moved %.0f° between two samples, turns may be missed: "
                      "lower magnetometer_update_interval", fabsf(dr) * 360.0f);
           }
 
@@ -497,12 +513,12 @@ script:
           //     The raw angle where the elapsed time reaches k/10 of the turn is breakpoint k. One
           //     turn mixes flow changes in; they are not tied to the dial position, the curve is,
           //     so the median over the last 15 turns keeps the curve and drops the flow changes. ---
-          auto &marks = id(magdial_learn_marks);
-          if (dr < 0 && r > last_r) id(magdial_learn_active) = false;  // went back across 0: drop the turn
+          auto &marks = id(${id_prefix}magdial_learn_marks);
+          if (dr < 0 && r > last_r) id(${id_prefix}magdial_learn_active) = false;  // went back across 0: drop the turn
           if (dr > 0 && r < last_r) {
-            if (id(magdial_learn_active)) {
-              const uint32_t total = now - id(magdial_learn_start);
-              while (id(magdial_learn_next) < 100) marks[id(magdial_learn_next)++] = total;
+            if (id(${id_prefix}magdial_learn_active)) {
+              const uint32_t total = now - id(${id_prefix}magdial_learn_start);
+              while (id(${id_prefix}magdial_learn_next) < 100) marks[id(${id_prefix}magdial_learn_next)++] = total;
               std::array<float, 9> turn_bp;
               int j = 0;
               for (int k = 1; k < 10; k++) {
@@ -512,12 +528,12 @@ script:
                 const float f = t_hi > t_lo ? (target - t_lo) / (t_hi - t_lo) : 0.0f;
                 turn_bp[k - 1] = (j + std::max(0.0f, std::min(1.0f, f))) / 100.0f;
               }
-              auto &hist = id(magdial_learn_history);
-              hist[id(magdial_learn_head)] = turn_bp;
-              id(magdial_learn_head) = (id(magdial_learn_head) + 1) % 15;
-              id(magdial_learn_count) = std::min(id(magdial_learn_count) + 1, 15);
-              id(magdial_curve_turns) = std::min(id(magdial_curve_turns) + 1, 15);
-              const int n = id(magdial_learn_count);
+              auto &hist = id(${id_prefix}magdial_learn_history);
+              hist[id(${id_prefix}magdial_learn_head)] = turn_bp;
+              id(${id_prefix}magdial_learn_head) = (id(${id_prefix}magdial_learn_head) + 1) % 15;
+              id(${id_prefix}magdial_learn_count) = std::min(id(${id_prefix}magdial_learn_count) + 1, 15);
+              id(${id_prefix}magdial_curve_turns) = std::min(id(${id_prefix}magdial_curve_turns) + 1, 15);
+              const int n = id(${id_prefix}magdial_learn_count);
               if (n >= 3) {
                 // Per breakpoint median; order statistics keep the breakpoints increasing
                 std::array<float, 9> curve;
@@ -527,47 +543,47 @@ script:
                   std::nth_element(col, col + n / 2, col + n);
                   curve[k] = col[n / 2];
                 }
-                id(magdial_curve) = curve;
+                id(${id_prefix}magdial_curve) = curve;
                 char text[64];
                 int len = 0;
                 for (int k = 0; k < 9 && len < (int) sizeof(text); k++)
                   len += snprintf(text + len, sizeof(text) - len, k ? " %.0f" : "%.0f", curve[k] * 360.0f);
-                id(magdial_curve_text).publish_state(text);
+                id(${id_prefix}magdial_curve_text).publish_state(text);
               }
             }
-            id(magdial_learn_active) = true;
-            id(magdial_learn_start) = now;
-            id(magdial_learn_next) = 0;
+            id(${id_prefix}magdial_learn_active) = true;
+            id(${id_prefix}magdial_learn_start) = now;
+            id(${id_prefix}magdial_learn_next) = 0;
             // Raw and Learned both map raw angle 0 to 0: switching here does not move the count
-            id(magdial_curve_active) =
-                id(magdial_angle_mapping).active_index().value_or(0) == 0 && id(magdial_curve_turns) >= 3;
-            id(magdial_last_angle) = map_angle(last_r);
+            id(${id_prefix}magdial_curve_active) =
+                id(${id_prefix}magdial_angle_mapping).active_index().value_or(0) == 0 && id(${id_prefix}magdial_curve_turns) >= 3;
+            id(${id_prefix}magdial_last_angle) = map_angle(last_r);
           }
-          if (id(magdial_learn_active)) {
-            while (id(magdial_learn_next) < 100 && r * 100.0f >= id(magdial_learn_next))
-              marks[id(magdial_learn_next)++] = now - id(magdial_learn_start);
+          if (id(${id_prefix}magdial_learn_active)) {
+            while (id(${id_prefix}magdial_learn_next) < 100 && r * 100.0f >= id(${id_prefix}magdial_learn_next))
+              marks[id(${id_prefix}magdial_learn_next)++] = now - id(${id_prefix}magdial_learn_start);
           }
 
           // --- Count: movement of the (mapped) dial position ---
           const float angle = map_angle(r);
-          float d = angle - id(magdial_last_angle);
+          float d = angle - id(${id_prefix}magdial_last_angle);
           if (d > 0.5f) d -= 1.0f;
           else if (d < -0.5f) d += 1.0f;
-          id(magdial_last_angle) = angle;
-          id(magdial_rotations_total) += d;
-          id(magdial_turn_clearance) = std::min(id(magdial_turn_clearance), radius);
+          id(${id_prefix}magdial_last_angle) = angle;
+          id(${id_prefix}magdial_rotations_total) += d;
+          id(${id_prefix}magdial_turn_clearance) = std::min(id(${id_prefix}magdial_turn_clearance), radius);
 
           // --- Adaptive calibration: after each complete forward turn, nudge toward observed extremes ---
-          auto &tlo = id(magdial_turn_lo);
-          auto &thi = id(magdial_turn_hi);
+          auto &tlo = id(${id_prefix}magdial_turn_lo);
+          auto &thi = id(${id_prefix}magdial_turn_hi);
           for (int i : {a, b}) {
             tlo[i] = std::min(tlo[i], v[i]);
             thi[i] = std::max(thi[i], v[i]);
           }
-          const double turn = floor(id(magdial_rotations_total));
-          if (turn > id(magdial_last_full_turn)) {
+          const double turn = floor(id(${id_prefix}magdial_rotations_total));
+          if (turn > id(${id_prefix}magdial_last_full_turn)) {
             // The first crossing after (re)start ends a partial turn: only start tracking there.
-            if (id(magdial_turn_tracking) && id(magdial_adaptive).state) {
+            if (id(${id_prefix}magdial_turn_tracking) && id(${id_prefix}magdial_adaptive).state) {
               bool plausible = true;
               for (int i : {a, b}) {
                 const float obs = (thi[i] - tlo[i]) / 2.0f;
@@ -579,72 +595,72 @@ script:
                   amp[i] += ${adapt_rate} * ((thi[i] - tlo[i]) / 2.0f - amp[i]);
                 }
               } else {
-                ESP_LOGD("magdial", "Turn extremes too far from calibration, not adapting");
+                ESP_LOGD("${id_prefix}magdial", "Turn extremes too far from calibration, not adapting");
               }
             }
-            if (id(magdial_turn_tracking)) id(magdial_clearance) = id(magdial_turn_clearance);
-            id(magdial_turn_clearance) = radius;
-            id(magdial_turn_tracking) = true;
-            id(magdial_last_full_turn) = turn;
+            if (id(${id_prefix}magdial_turn_tracking)) id(${id_prefix}magdial_clearance) = id(${id_prefix}magdial_turn_clearance);
+            id(${id_prefix}magdial_turn_clearance) = radius;
+            id(${id_prefix}magdial_turn_tracking) = true;
+            id(${id_prefix}magdial_last_full_turn) = turn;
             for (int i = 0; i < 3; i++) tlo[i] = thi[i] = v[i];
           }
 
-  - id: magdial_calibrate
+  - id: ${id_prefix}magdial_calibrate
     mode: restart
     then:
       - lambda: |-
-          ESP_LOGI("magdial", "Calibration started: run water for at least one full turn of the dial");
-          id(magdial_cal_lo).fill(std::numeric_limits<float>::max());
-          id(magdial_cal_hi).fill(std::numeric_limits<float>::lowest());
-          id(magdial_cal_samples) = 0;
-          id(magdial_cal_points).clear();
-          id(magdial_cal_points).reserve(400);
-          id(magdial_cal_thin) = 1;
-          id(magdial_cal_finish) = false;
-          id(magdial_cal_phase) = 1;
-          id(magdial_calibration_status).publish_state("Calibrating: run water for at least one full turn");
+          ESP_LOGI("${id_prefix}magdial", "Calibration started: run water for at least one full turn of the dial");
+          id(${id_prefix}magdial_cal_lo).fill(std::numeric_limits<float>::max());
+          id(${id_prefix}magdial_cal_hi).fill(std::numeric_limits<float>::lowest());
+          id(${id_prefix}magdial_cal_samples) = 0;
+          id(${id_prefix}magdial_cal_points).clear();
+          id(${id_prefix}magdial_cal_points).reserve(400);
+          id(${id_prefix}magdial_cal_thin) = 1;
+          id(${id_prefix}magdial_cal_finish) = false;
+          id(${id_prefix}magdial_cal_phase) = 1;
+          id(${id_prefix}magdial_calibration_status).publish_state("Calibrating: run water for at least one full turn");
       - wait_until:
           condition:
-            lambda: return id(magdial_cal_finish);
-          timeout: !lambda return id(magdial_calibration_time).state * 1000;
+            lambda: return id(${id_prefix}magdial_cal_finish);
+          timeout: !lambda return id(${id_prefix}magdial_calibration_time).state * 1000;
       - lambda: |-
-          id(magdial_cal_phase) = 0;
+          id(${id_prefix}magdial_cal_phase) = 0;
           // Moved out so the buffer is freed whatever the outcome
-          const std::vector<std::array<int16_t, 3>> pts = std::move(id(magdial_cal_points));
-          id(magdial_cal_points) = {};
+          const std::vector<std::array<int16_t, 3>> pts = std::move(id(${id_prefix}magdial_cal_points));
+          id(${id_prefix}magdial_cal_points) = {};
           auto fail = [](const std::string &msg) {
-            ESP_LOGE("magdial", "Calibration failed: %s", msg.c_str());
-            id(magdial_calibration_status).publish_state("Failed: " + msg);
-            id(magdial_have_last) = false;
+            ESP_LOGE("${id_prefix}magdial", "Calibration failed: %s", msg.c_str());
+            id(${id_prefix}magdial_calibration_status).publish_state("Failed: " + msg);
+            id(${id_prefix}magdial_have_last) = false;
           };
-          if (id(magdial_cal_samples) < 10) {
+          if (id(${id_prefix}magdial_cal_samples) < 10) {
             fail("no magnetometer data");
             return;
           }
 
-          const auto &lo = id(magdial_cal_lo);
-          const auto &hi = id(magdial_cal_hi);
+          const auto &lo = id(${id_prefix}magdial_cal_lo);
+          const auto &hi = id(${id_prefix}magdial_cal_hi);
           const char *AXIS = "xyz";
           static const int AXES[3][2] = {{0, 1}, {0, 2}, {1, 2}};
           std::array<float, 3> center, amp;
           for (int i = 0; i < 3; i++) {
             center[i] = (hi[i] + lo[i]) / 2.0f;
             amp[i] = (hi[i] - lo[i]) / 2.0f;
-            ESP_LOGI("magdial", "%c: min %.1f max %.1f amplitude %.1f µT", AXIS[i], lo[i], hi[i], amp[i]);
+            ESP_LOGI("${id_prefix}magdial", "%c: min %.1f max %.1f amplitude %.1f µT", AXIS[i], lo[i], hi[i], amp[i]);
           }
-          ESP_LOGI("magdial", "%u samples, %u trajectory points%s", (unsigned) id(magdial_cal_samples),
+          ESP_LOGI("${id_prefix}magdial", "%u samples, %u trajectory points%s", (unsigned) id(${id_prefix}magdial_cal_samples),
                    (unsigned) pts.size(), pts.size() >= 400 ? " (buffer full, finished early)" : "");
 
           // For each pair: how often the normalised loop winds around its center (turns seen,
           // signed by the direction), and how close it comes to the center (noise margin).
-          const float min_amp = id(magdial_calibration_min_amplitude).state;
+          const float min_amp = id(${id_prefix}magdial_calibration_min_amplitude).state;
           std::array<float, 3> winding{}, clearance{};
           int best = -1, usable = 0;
           float best_score = 0;
           for (int p = 0; p < 3; p++) {
             const int a = AXES[p][0], b = AXES[p][1];
             if (amp[a] < min_amp || amp[b] < min_amp) {
-              ESP_LOGI("magdial", "%c/%c: amplitude below %.1f µT", AXIS[a], AXIS[b], min_amp);
+              ESP_LOGI("${id_prefix}magdial", "%c/%c: amplitude below %.1f µT", AXIS[a], AXIS[b], min_amp);
               continue;
             }
             usable++;
@@ -661,7 +677,7 @@ script:
             // Score: clearance in µT. Axes swinging in phase make a flat loop that passes
             // through its center and cannot be tracked.
             const float score = clear * std::min(amp[a], amp[b]);
-            ESP_LOGI("magdial", "%c/%c: %+.2f turns, clearance %.0f%% (%.1f µT)", AXIS[a], AXIS[b], w,
+            ESP_LOGI("${id_prefix}magdial", "%c/%c: %+.2f turns, clearance %.0f%% (%.1f µT)", AXIS[a], AXIS[b], w,
                      clear * 100.0f, score);
             if (clear >= 0.2f && score >= min_amp / 2.0f && score > best_score) {
               best = p;
@@ -700,33 +716,33 @@ script:
                                fabsf(winding[p]) >= 0.95f;
             if (valid) sign[p] = winding[p] < 0 ? -1.0f : 1.0f;
           }
-          id(magdial_center) = center;
-          id(magdial_amplitude) = amp;
-          id(magdial_pair_sign) = sign;
-          id(magdial_clearance) = clearance[best];
-          id(magdial_cal_turns) = fabsf(winding[best]);
+          id(${id_prefix}magdial_center) = center;
+          id(${id_prefix}magdial_amplitude) = amp;
+          id(${id_prefix}magdial_pair_sign) = sign;
+          id(${id_prefix}magdial_clearance) = clearance[best];
+          id(${id_prefix}magdial_cal_turns) = fabsf(winding[best]);
           // New geometry, new raw angle: learn the curve again
-          id(magdial_curve) = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f};
-          id(magdial_curve_turns) = 0;
-          id(magdial_learn_count) = 0;
-          id(magdial_learn_head) = 0;
-          id(magdial_learn_active) = false;
-          id(magdial_curve_text).publish_state("");
+          id(${id_prefix}magdial_curve) = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f};
+          id(${id_prefix}magdial_curve_turns) = 0;
+          id(${id_prefix}magdial_learn_count) = 0;
+          id(${id_prefix}magdial_learn_head) = 0;
+          id(${id_prefix}magdial_learn_active) = false;
+          id(${id_prefix}magdial_curve_text).publish_state("");
 
           const int a = AXES[best][0], b = AXES[best][1];
           char details[96];
           snprintf(details, sizeof(details), "%c/%c, %.2f turns, clearance %.0f%% (%.0f µT)", AXIS[a], AXIS[b],
                    fabsf(winding[best]), clearance[best] * 100.0f, best_score);
-          ESP_LOGI("magdial", "Calibration complete: %s", details);
-          id(magdial_axis_pair).make_call().set_index(best).perform();  // also re-syncs the angle
-          id(magdial_have_last) = false;
-          id(magdial_calibration_status).publish_state("Ready");
-          id(magdial_calibration_details).publish_state(details);
+          ESP_LOGI("${id_prefix}magdial", "Calibration complete: %s", details);
+          id(${id_prefix}magdial_axis_pair).make_call().set_index(best).perform();  // also re-syncs the angle
+          id(${id_prefix}magdial_have_last) = false;
+          id(${id_prefix}magdial_calibration_status).publish_state("Ready");
+          id(${id_prefix}magdial_calibration_details).publish_state(details);
 
 sensor:
   - platform: template
-    id: magdial_total
-    name: Total
+    id: ${id_prefix}magdial_total
+    name: ${name_prefix}Total
     device_class: ${device_class}
     icon: ${device_icon}
     state_class: total_increasing
@@ -736,17 +752,17 @@ sensor:
     lambda: |-
       // Ratchet: sensor noise and back-flow must never make a total_increasing sensor go down.
       const double total =
-          id(magdial_rotations_total) * id(magdial_volume_per_rotation).state + id(magdial_volume_offset);
-      if (total > id(magdial_total_published)) id(magdial_total_published) = total;
-      return id(magdial_total_published);
+          id(${id_prefix}magdial_rotations_total) * id(${id_prefix}magdial_volume_per_rotation).state + id(${id_prefix}magdial_volume_offset);
+      if (total > id(${id_prefix}magdial_total_published)) id(${id_prefix}magdial_total_published) = total;
+      return id(${id_prefix}magdial_total_published);
     filters:
       - or:
           - throttle: 60s
           - delta: 0
 
   - platform: template
-    id: magdial_flow
-    name: Flow
+    id: ${id_prefix}magdial_flow
+    name: ${name_prefix}Flow
     device_class: volume_flow_rate
     icon: mdi:speedometer
     state_class: measurement
@@ -754,11 +770,11 @@ sensor:
     accuracy_decimals: ${flow_accuracy_decimals}
     update_interval: ${flow_update_interval}
     lambda: |-
-      static double last_rot = NAN;
-      static uint32_t last_ms = 0;
+      double &last_rot = id(${id_prefix}magdial_flow_last_rot);
+      uint32_t &last_ms = id(${id_prefix}magdial_flow_last_ms);
       const uint32_t now = millis();
-      const double rot = id(magdial_rotations_total);
-      if (std::isnan(last_rot) || id(magdial_cal_phase) != 0) {
+      const double rot = id(${id_prefix}magdial_rotations_total);
+      if (std::isnan(last_rot) || id(${id_prefix}magdial_cal_phase) != 0) {
         last_rot = rot;
         last_ms = now;
         return 0.0f;
@@ -776,7 +792,7 @@ sensor:
       }
       last_rot = rot;
       last_ms = now;
-      return moved * id(magdial_volume_per_rotation).state * 60000.0 / dt;
+      return moved * id(${id_prefix}magdial_volume_per_rotation).state * 60000.0 / dt;
     filters:
       - or:
           - throttle: 60s
@@ -784,18 +800,18 @@ sensor:
 
   # --- Debug / diagnostic ---
   - platform: template
-    name: Rotations total
+    name: ${name_prefix}Rotations total
     entity_category: diagnostic
     icon: mdi:counter
     accuracy_decimals: 3
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
-    lambda: return id(magdial_rotations_total);
+    lambda: return id(${id_prefix}magdial_rotations_total);
     filters:
       - delta: 0.001
 
   - platform: template
-    name: Dial angle
+    name: ${name_prefix}Dial angle
     entity_category: diagnostic
     icon: mdi:angle-acute
     unit_of_measurement: °
@@ -803,39 +819,39 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      const double r = id(magdial_rotations_total);
+      const double r = id(${id_prefix}magdial_rotations_total);
       return (r - floor(r)) * 360.0;
     filters:
       - delta: 1
 
   - platform: template
-    name: Curve learned turns
+    name: ${name_prefix}Curve learned turns
     entity_category: diagnostic
     icon: mdi:school
     accuracy_decimals: 0
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
-    lambda: return id(magdial_curve_turns);
+    lambda: return id(${id_prefix}magdial_curve_turns);
     filters:
       - delta: 1
 
   # Closest approach of the loop to its center over the last turn, in % of the amplitude.
   # Falling toward 0 means the field changed (sensor moved, drift): recalibrate.
   - platform: template
-    name: Signal clearance
+    name: ${name_prefix}Signal clearance
     entity_category: diagnostic
     icon: mdi:signal
     unit_of_measurement: '%'
     accuracy_decimals: 0
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
-    lambda: return id(magdial_clearance) * 100.0f;
+    lambda: return id(${id_prefix}magdial_clearance) * 100.0f;
     filters:
       - delta: 1
 
   # Extremes per axis: live while calibrating, calibrated (and adapted) values otherwise.
   - platform: template
-    name: Magnetic field X min
+    name: ${name_prefix}Magnetic field X min
     entity_category: diagnostic
     icon: mdi:arrow-collapse-down
     unit_of_measurement: µT
@@ -843,12 +859,12 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_lo)[0] : NAN;
-      return id(magdial_center)[0] - id(magdial_amplitude)[0];
+      if (id(${id_prefix}magdial_cal_phase) == 1) return id(${id_prefix}magdial_cal_samples) ? id(${id_prefix}magdial_cal_lo)[0] : NAN;
+      return id(${id_prefix}magdial_center)[0] - id(${id_prefix}magdial_amplitude)[0];
     filters:
       - delta: 0.1
   - platform: template
-    name: Magnetic field X max
+    name: ${name_prefix}Magnetic field X max
     entity_category: diagnostic
     icon: mdi:arrow-collapse-up
     unit_of_measurement: µT
@@ -856,12 +872,12 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_hi)[0] : NAN;
-      return id(magdial_center)[0] + id(magdial_amplitude)[0];
+      if (id(${id_prefix}magdial_cal_phase) == 1) return id(${id_prefix}magdial_cal_samples) ? id(${id_prefix}magdial_cal_hi)[0] : NAN;
+      return id(${id_prefix}magdial_center)[0] + id(${id_prefix}magdial_amplitude)[0];
     filters:
       - delta: 0.1
   - platform: template
-    name: Magnetic field Y min
+    name: ${name_prefix}Magnetic field Y min
     entity_category: diagnostic
     icon: mdi:arrow-collapse-down
     unit_of_measurement: µT
@@ -869,12 +885,12 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_lo)[1] : NAN;
-      return id(magdial_center)[1] - id(magdial_amplitude)[1];
+      if (id(${id_prefix}magdial_cal_phase) == 1) return id(${id_prefix}magdial_cal_samples) ? id(${id_prefix}magdial_cal_lo)[1] : NAN;
+      return id(${id_prefix}magdial_center)[1] - id(${id_prefix}magdial_amplitude)[1];
     filters:
       - delta: 0.1
   - platform: template
-    name: Magnetic field Y max
+    name: ${name_prefix}Magnetic field Y max
     entity_category: diagnostic
     icon: mdi:arrow-collapse-up
     unit_of_measurement: µT
@@ -882,12 +898,12 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_hi)[1] : NAN;
-      return id(magdial_center)[1] + id(magdial_amplitude)[1];
+      if (id(${id_prefix}magdial_cal_phase) == 1) return id(${id_prefix}magdial_cal_samples) ? id(${id_prefix}magdial_cal_hi)[1] : NAN;
+      return id(${id_prefix}magdial_center)[1] + id(${id_prefix}magdial_amplitude)[1];
     filters:
       - delta: 0.1
   - platform: template
-    name: Magnetic field Z min
+    name: ${name_prefix}Magnetic field Z min
     entity_category: diagnostic
     icon: mdi:arrow-collapse-down
     unit_of_measurement: µT
@@ -895,12 +911,12 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_lo)[2] : NAN;
-      return id(magdial_center)[2] - id(magdial_amplitude)[2];
+      if (id(${id_prefix}magdial_cal_phase) == 1) return id(${id_prefix}magdial_cal_samples) ? id(${id_prefix}magdial_cal_lo)[2] : NAN;
+      return id(${id_prefix}magdial_center)[2] - id(${id_prefix}magdial_amplitude)[2];
     filters:
       - delta: 0.1
   - platform: template
-    name: Magnetic field Z max
+    name: ${name_prefix}Magnetic field Z max
     entity_category: diagnostic
     icon: mdi:arrow-collapse-up
     unit_of_measurement: µT
@@ -908,7 +924,7 @@ sensor:
     update_interval: ${debug_update_interval}
     internal: ${hide_debug_sensors}
     lambda: |-
-      if (id(magdial_cal_phase) == 1) return id(magdial_cal_samples) ? id(magdial_cal_hi)[2] : NAN;
-      return id(magdial_center)[2] + id(magdial_amplitude)[2];
+      if (id(${id_prefix}magdial_cal_phase) == 1) return id(${id_prefix}magdial_cal_samples) ? id(${id_prefix}magdial_cal_hi)[2] : NAN;
+      return id(${id_prefix}magdial_center)[2] + id(${id_prefix}magdial_amplitude)[2];
     filters:
       - delta: 0.1

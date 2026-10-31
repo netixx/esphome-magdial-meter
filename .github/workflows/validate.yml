@@ -58,3 +58,8 @@ jobs:
         run: |
           esphome compile tests/sim-learned-curve.yaml
           cd tests && ./.esphome/build/magdial-sim-learned/.pioenvs/magdial-sim-learned/program
+
+      - name: Simulation, three meters on one device
+        run: |
+          esphome compile tests/sim-multi.yaml
+          cd tests && ./.esphome/build/magdial-sim-multi/.pioenvs/magdial-sim-multi/program

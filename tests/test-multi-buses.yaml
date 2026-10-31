@@ -1,0 +1,17 @@
+---
+# Same chip on two buses (fixed address), plus a different chip sharing the first bus.
+packages:
+  base: !include base-esp32.yaml
+  cold: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: cold_, name_prefix: 'Cold water ', driver: qmc5883l, i2c_id: i2c_bus}
+  hot: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: hot_, name_prefix: 'Hot water ', driver: qmc5883l, i2c_id: i2c_bus_2}
+  garden: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: garden_, name_prefix: 'Garden ', driver: mmc5603, i2c_id: i2c_bus}
+i2c:
+  - id: i2c_bus_2
+    sda: GPIO14
+    scl: GPIO15

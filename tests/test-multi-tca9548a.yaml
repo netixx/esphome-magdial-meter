@@ -1,0 +1,23 @@
+---
+# Three identical sensors (same fixed address) behind a TCA9548A multiplexer.
+packages:
+  base: !include base-esp32.yaml
+  cold: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: cold_, name_prefix: 'Cold water ', driver: qmc5883l, i2c_id: mux_0}
+  hot: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: hot_, name_prefix: 'Hot water ', driver: qmc5883l, i2c_id: mux_1}
+  garden: !include
+    file: ../magdial-meter.yaml
+    vars: {id_prefix: garden_, name_prefix: 'Garden ', driver: qmc5883l, i2c_id: mux_2}
+tca9548a:
+  - address: 0x70
+    i2c_id: i2c_bus
+    channels:
+      - bus_id: mux_0
+        channel: 0
+      - bus_id: mux_1
+        channel: 1
+      - bus_id: mux_2
+        channel: 2

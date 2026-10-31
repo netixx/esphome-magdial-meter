@@ -2,7 +2,6 @@
 # The package must not set per-tag log levels more verbose than a strict global level.
 packages:
   base: !include base-esp32.yaml
-  meter: !include ../magdial-meter.yaml
-  driver: !include ../drivers/qmc5883l.yaml
+  meter: !include {file: ../magdial-meter.yaml, vars: {driver: qmc5883l}}
 logger:
   level: WARN

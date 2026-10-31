@@ -50,9 +50,7 @@ logger:
 api:
 
 packages:
-  meter: !include ../magdial-meter.yaml
-
-i2c: !remove
+  meter: !include {file: ../magdial-meter.yaml, vars: {driver: none}}
 
 sensor:
   - platform: template

@@ -1,5 +1,4 @@
 ---
 packages:
   base: !include base-esp32.yaml
-  meter: !include ../magdial-meter.yaml
-  driver: !include ../drivers/mlx90393.yaml
+  meter: !include {file: ../magdial-meter.yaml, vars: {driver: mlx90393}}

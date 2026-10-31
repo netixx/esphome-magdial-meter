@@ -13,3 +13,7 @@ api:
 wifi:
   ssid: "test-ssid"
   password: "test-password"
+i2c:
+  - id: i2c_bus
+    sda: GPIO13
+    scl: GPIO16

@@ -1,18 +1,22 @@
 ---
 # Example device: ESP32 + QMC5883P on a 10 L/turn water meter.
 # Keep your own esphome:, esp32:, network (wifi: or ethernet:), api: and ota: blocks.
-substitutions:
-  volume_unit: 'L'
-  volume_per_rotation_initial_value: '10'
-  i2c_sda: GPIO13
-  i2c_scl: GPIO16
-  i2c_frequency: 100kHz
+i2c:
+  - id: i2c_bus
+    sda: GPIO13
+    scl: GPIO16
+    frequency: 100kHz
 
 packages:
-  meter:
+  water:
     url: https://github.com/netixx/esphome-magdial-meter
     ref: main
-    files: [magdial-meter.yaml, drivers/qmc5883p.yaml]
+    files:
+      - path: magdial-meter.yaml
+        vars:
+          driver: qmc5883p
+          volume_unit: 'L'
+          volume_per_rotation_initial_value: '10'
     refresh: 1d
 
 esphome:
